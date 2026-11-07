@@ -1,3 +1,6 @@
+<img width="1917" height="1015" alt="image" src="https://github.com/user-attachments/assets/9865e922-d3ea-47cd-a66d-63b26d4c7ff5" />
+
+
 # MUNG-ASH — Memory-Safe Network Protocol Analyzer & AI-Native Packet Suite
 
 **MUNG-ASH** (`mash`) is a clean-room, 100% safe Rust (`#[forbid(unsafe_code)]`) network protocol analyzer, capture engine, and CLI/GUI/MCP suite with pluggable local and cloud AI assistants.
