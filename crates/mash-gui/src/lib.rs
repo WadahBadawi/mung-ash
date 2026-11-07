@@ -1,4 +1,5 @@
 pub mod app;
+pub mod theme;
 
 use mash_ai::AiEngine;
 use mash_core::{
@@ -693,5 +694,40 @@ mod tests {
                 pkt.summary
             );
         }
+    }
+
+    #[test]
+    fn enterprise_analytics_workstation_views_and_theme() {
+        let ws = AnalyzerWorkspace::new();
+        let mut app = crate::app::MashGuiApp::new(ws);
+        assert_eq!(app.main_view, crate::app::MainWorkstationView::PacketInspector);
+
+        // Verify switching to all enterprise workstation views
+        let views = [
+            crate::app::MainWorkstationView::CaptureWorkstation,
+            crate::app::MainWorkstationView::McpConsole,
+            crate::app::MainWorkstationView::PacketEditor,
+            crate::app::MainWorkstationView::FileProperties,
+            crate::app::MainWorkstationView::AiAnalyst,
+            crate::app::MainWorkstationView::Statistics,
+            crate::app::MainWorkstationView::MergeFiles,
+            crate::app::MainWorkstationView::Text2Pcap,
+            crate::app::MainWorkstationView::PacketInspector,
+        ];
+        for view in views {
+            app.main_view = view;
+            assert_eq!(app.main_view, view);
+        }
+
+        // Verify protocol badge colors return distinct high-contrast tints
+        let (http_fg, http_bg) = crate::theme::protocol_badge_colors("HTTP");
+        assert_eq!(http_bg, crate::theme::colors::PRIMARY_CONTAINER);
+        assert_eq!(http_fg, crate::theme::colors::ON_PRIMARY);
+
+        let (_tls_fg, tls_bg) = crate::theme::protocol_badge_colors("TLSv1.3");
+        assert_eq!(tls_bg, crate::theme::colors::SECONDARY_CONTAINER);
+
+        let (_err_fg, err_bg) = crate::theme::protocol_badge_colors("Malformed Packet: DNS");
+        assert_eq!(err_bg, crate::theme::colors::ERROR_CONTAINER);
     }
 }
