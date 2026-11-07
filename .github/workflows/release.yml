@@ -63,9 +63,10 @@ jobs:
         run: |
           $Stage = "mung-ash-${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path $Stage | Out-Null
-          foreach ($bin in @("mash.exe","mash-gui.exe","mash-cap.exe","mash-info.exe","mash-edit.exe","mash-merge.exe","mash-text2pcap.exe","mash-mcp.exe")) {
+          foreach ($bin in @("mung-ash.exe","mash.exe","mash-gui.exe","mash-cap.exe","mash-info.exe","mash-edit.exe","mash-merge.exe","mash-text2pcap.exe","mash-mcp.exe")) {
             Copy-Item "target/${{ matrix.target }}/release/$bin" "$Stage/$bin"
           }
+          Copy-Item "target/${{ matrix.target }}/release/mung-ash.exe" "mung-ash.exe"
           Copy-Item README.md, install.ps1 $Stage
           Compress-Archive -Path "$Stage/*" -DestinationPath "${Stage}.zip" -Force
           $hash = (Get-FileHash "${Stage}.zip" -Algorithm SHA256).Hash.ToLower()

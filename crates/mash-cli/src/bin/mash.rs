@@ -39,6 +39,7 @@ fn print_help() {
     println!("  -r <infile>                     Read packets from capture file (.pcap/.pcapng/.gz/.lz4)");
     println!("  -w <outfile>                    Write filtered packets to output file");
     println!("  -F <pcap|pcapng>                Output capture file format (default: pcapng)");
+    println!("  --gui                           Launch unified 3-pane Desktop GUI (mash-gui)");
     println!("  --tui                           Launch interactive 3-pane terminal UI");
     println!("  --tui-once                      Render single 3-pane TUI frame to stdout and exit");
     println!("Filtering & Dissection:");
@@ -163,6 +164,20 @@ fn main() {
                     i += 2;
                     continue;
                 }
+            }
+            "--gui" => {
+                let fwd: Vec<String> = args.iter().filter(|a| a.as_str() != "--gui").cloned().collect();
+                let gui_exe = env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.join(if cfg!(windows) { "mash-gui.exe" } else { "mash-gui" })))
+                    .filter(|p| p.exists())
+                    .unwrap_or_else(|| std::path::PathBuf::from("mash-gui"));
+                let status = std::process::Command::new(gui_exe).args(&fwd).status();
+                if let Err(e) = status {
+                    eprintln!("mash: failed to launch mash-gui: {e}");
+                    std::process::exit(1);
+                }
+                return;
             }
             "--tui" => tui_mode = true,
             "--tui-once" => tui_once = true,

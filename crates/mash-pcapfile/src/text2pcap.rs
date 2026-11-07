@@ -30,7 +30,7 @@ impl Default for Text2PcapOptions {
     }
 }
 
-/// Parse one or more packets from a hex dump text (like `od -Ax -tx1` or Wireshark's Export Packet Bytes).
+/// Parse one or more packets from a hex dump text (like `od -Ax -tx1` or standard hex-dump output).
 /// A new offset `0000` (after bytes have already been accumulated) starts a new packet.
 pub fn parse_hexdump_packets(input: &str, opts: &Text2PcapOptions) -> Vec<Frame> {
     let mut raw_packets: Vec<Vec<u8>> = Vec::new();

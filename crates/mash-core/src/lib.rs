@@ -647,7 +647,7 @@ impl FieldTree {
         self.nodes.iter().filter(move |n| n.abbrev == abbrev)
     }
 
-    /// Return the N-th occurrence (1-based, like `ip.src#2` in Wireshark display filters) of a field.
+    /// Return the N-th occurrence (1-based, like `ip.src#2` in display filters) of a field.
     pub fn by_abbrev_layer(&self, abbrev: &str, layer_1based: usize) -> Option<&FieldNode> {
         if layer_1based == 0 {
             return None;

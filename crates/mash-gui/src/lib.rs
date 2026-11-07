@@ -1,3 +1,5 @@
+pub mod app;
+
 use mash_ai::AiEngine;
 use mash_core::{
     ByteRange, DissectedPacket, Frame, NameResolver, NodeId, ResolutionConfig, Result,
@@ -514,5 +516,14 @@ mod tests {
         // Setting Time Reference on Frame 2 makes Frame 2's relative time 0.0
         ws.toggle_time_reference(2);
         assert!((ws.dissected[1].summary.rel_time_sec - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unified_all_in_one_gui_app_state() {
+        let ws = AnalyzerWorkspace::new();
+        let app = crate::app::MashGuiApp::new(ws);
+        assert_eq!(app.ws.frames.len(), 14);
+        assert!(!app.tcp_streams.is_empty());
+        assert!(!app.udp_streams.is_empty());
     }
 }

@@ -3,13 +3,14 @@ use std::env;
 use std::io::{self, BufRead, Write};
 
 fn print_help() {
-    println!("mash-gui {} — MUNG-ASH Three-Pane Interactive Protocol Analyzer", env!("CARGO_PKG_VERSION"));
+    println!("mash-gui {} — MUNG-ASH All-in-One 3-Pane Desktop Protocol Analyzer", env!("CARGO_PKG_VERSION"));
     println!("Usage: mash-gui [OPTIONS] [capture-file]");
     println!("Options:");
     println!("  -r <infile>       Load capture file (.pcap/.pcapng/.gz/.lz4)");
     println!("  -Y <filter>       Initial display filter expression");
     println!("  -g <frame_no>     Jump to 1-based packet number");
-    println!("  --snapshot        Print 3-pane workspace view and exit");
+    println!("  --snapshot        Print 3-pane workspace view to stdout and exit");
+    println!("  --repl            Run interactive terminal REPL instead of native GUI window");
     println!("  -h, --help        Show this help message");
 }
 
@@ -20,6 +21,7 @@ fn main() {
     let mut initial_filter: Option<String> = None;
     let mut goto_frame: Option<u64> = None;
     let mut snapshot_only = false;
+    let mut repl_mode = false;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -50,6 +52,7 @@ fn main() {
                 }
             }
             "--snapshot" => snapshot_only = true,
+            "--repl" => repl_mode = true,
             other if !other.starts_with('-') && infile.is_none() => {
                 infile = Some(other.to_string());
             }
@@ -71,8 +74,24 @@ fn main() {
         ws.select_frame(fno);
     }
 
+    if snapshot_only {
+        if ws.frames.is_empty() {
+            ws.load_capture(mash_gui::app::generate_sample_showcase_capture());
+        }
+        print!("{}", ws.render_three_pane_snapshot(20));
+        return;
+    }
+
+    if !repl_mode {
+        if let Err(e) = mash_gui::app::run_native_gui(ws) {
+            eprintln!("mash-gui: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     print!("{}", ws.render_three_pane_snapshot(20));
-    if snapshot_only || ws.frames.is_empty() {
+    if ws.frames.is_empty() {
         return;
     }
 

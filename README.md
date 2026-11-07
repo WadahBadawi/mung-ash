@@ -21,8 +21,30 @@
 | `crates/mash-plugin` | Declarative custom protocol dissector plugin loader and sandboxed runtime |
 | `crates/mash-capture` | Host OS interface discovery, safe BPF capture filter compiler (`BpfFilter`), live UDP/probe capture engine, and ring-buffer file rotation coordinator |
 | `crates/mash-cap` | Minimal isolated packet capture helper binary (`mash-cap`) with zero dissector/filter/AI dependencies |
-| `crates/mash-cli` | Complete CLI & 3-pane TUI suite (`mash`, `mash --tui`, `mash-info`, `mash-edit`, `mash-merge`, `mash-text2pcap`) |
-| `crates/mash-gui` | Three-pane synchronized analyzer workspace (`mash-gui`) with virtualized packet list, bidirectional field-to-byte highlighting, coloring rules, and profiles |
+| `crates/mash-cli` | Complete CLI & 3-pane TUI suite (`mash`, `mash --gui`, `mash --tui`, `mash-info`, `mash-edit`, `mash-merge`, `mash-text2pcap`) |
+| `crates/mash-gui` | Native 3-pane Desktop GUI (`mash-gui`, powered by `eframe`/`egui`) unifying all 8 MUNG-ASH tools in one application |
+
+---
+
+## All-in-One Desktop GUI (`mung-ash.exe` / `mash-gui` / `mash --gui`)
+
+Launch the native desktop graphical interface with:
+
+```powershell
+mung-ash
+# or
+mash-gui
+# or
+mash --gui
+```
+
+The GUI provides a classic layout with all 8 MUNG-ASH tools built directly into the top toolbar and menu bar:
+- **Top Menu & Toolbar**: Quick access to **Live Capture (`mash-cap`)**, **Demo Multi-Protocol Showcase Capture**, **File Open/Save**, **Capture Properties (`mash-info`)**, **Packet Editor & HMAC Anonymizer (`mash-edit`)**, **Capture Merger (`mash-merge`)**, **Hex2Pcap Importer (`mash-text2pcap`)**, **Follow TCP/UDP Stream**, **Protocol Hierarchy & Conversation Statistics**, **AI Security Analyst (`mash-ai`)**, and **MCP JSON-RPC 2.0 Console (`mash-mcp`)**.
+- **Live Display Filter Bar**: Instant green/red syntax validation, edit-distance `Did you mean ...?` auto-fix buttons, and one-click protocol filter presets.
+- **Synchronized 3-Pane Workspace**:
+  - **Pane 1 (Packet List)**: Resizable, striped table (`No.`, `Time`, `Source`, `Destination`, `Protocol`, `Length`, `Info`) with color rules and right-click context menu (`Mark`, `Time Reference`, `Follow Stream`, `Explain with AI`).
+  - **Pane 2 (Protocol Details Tree)**: Expandable protocol hierarchy with Expert Info severity badges, right-click `Apply as Filter` / `Copy`, and click-to-highlight bytes in Pane 3.
+  - **Pane 3 (Packet Bytes — Hex + ASCII)**: 16-byte aligned Hex + ASCII view with secondary Data Source tabs and click-any-byte to jump directly to the owning field in Pane 2.
 
 ---
 

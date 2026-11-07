@@ -23,6 +23,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $Binaries = @(
+    "mung-ash.exe",
     "mash.exe",
     "mash-gui.exe",
     "mash-cap.exe",
@@ -95,6 +96,7 @@ if ($CreateZip) {
     foreach ($bin in $Binaries) {
         Copy-Item -Force (Join-Path $InstallDir $bin) (Join-Path $StageDir $bin)
     }
+    Copy-Item -Force (Join-Path $InstallDir "mung-ash.exe") (Join-Path $DistDir "mung-ash.exe")
     Copy-Item -Force (Join-Path $RepoRoot "README.md") (Join-Path $StageDir "README.md")
     Copy-Item -Force (Join-Path $RepoRoot "install.ps1") (Join-Path $StageDir "install.ps1")
 

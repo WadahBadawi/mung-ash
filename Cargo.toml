@@ -38,6 +38,13 @@ mash-ai = { path = "crates/mash-ai" }
 mash-mcp = { path = "crates/mash-mcp" }
 mash-plugin = { path = "crates/mash-plugin" }
 mash-capture = { path = "crates/mash-capture" }
+mash-cli = { path = "crates/mash-cli" }
+mash-gui = { path = "crates/mash-gui" }
+
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
+egui = "0.31"
+egui_extras = "0.31"
+rfd = "0.15"
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

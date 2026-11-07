@@ -8,6 +8,10 @@ license.workspace = true
 name = "mash-gui"
 path = "src/main.rs"
 
+[[bin]]
+name = "mung-ash"
+path = "src/bin/mung_ash.rs"
+
 [dependencies]
 mash-core.workspace = true
 mash-pcapfile.workspace = true
@@ -18,8 +22,15 @@ mash-filter.workspace = true
 mash-crypto.workspace = true
 mash-stats.workspace = true
 mash-ai.workspace = true
+mash-capture.workspace = true
+mash-mcp.workspace = true
+mash-cli.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+eframe.workspace = true
+egui.workspace = true
+egui_extras.workspace = true
+rfd.workspace = true
 
 [lints]
 workspace = true
