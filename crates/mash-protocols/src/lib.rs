@@ -1,4 +1,5 @@
 pub mod application;
+pub mod enterprise;
 pub mod link;
 pub mod network;
 pub mod transport;
@@ -6,6 +7,10 @@ pub mod transport;
 use application::{
     DhcpDissector, DnsDissector, HttpDissector, NtpDissector, QuicDissector, TextProtocolDissector,
     TlsDissector,
+};
+use enterprise::{
+    BgpDissector, Dhcpv6Dissector, GrpcDissector, ModbusTcpDissector, MqttDissector, OspfDissector,
+    Smb2Dissector,
 };
 use link::{
     EthernetDissector, LinuxSllDissector, NullLoopbackDissector, RawIpDissector, VlanDissector,
@@ -190,6 +195,33 @@ pub fn register_all_protocols(engine: &mut DissectorEngine) {
     // Heuristics for non-standard TCP ports
     engine.register_tcp_heuristic(http_id);
     engine.register_tcp_heuristic(tls_id);
+
+    // 5. Enterprise, Routing, Cloud & Industrial protocols
+    let bgp_id = BgpDissector::register(&mut engine.registry);
+    let ospf_id = OspfDissector::register(&mut engine.registry);
+    let dhcpv6_id = Dhcpv6Dissector::register(&mut engine.registry);
+    let smb2_id = Smb2Dissector::register(&mut engine.registry);
+    let grpc_id = GrpcDissector::register(&mut engine.registry);
+    let mqtt_id = MqttDissector::register(&mut engine.registry);
+    let modbus_id = ModbusTcpDissector::register(&mut engine.registry);
+
+    engine.register_dissector(Arc::new(BgpDissector::new(bgp_id)));
+    engine.register_dissector(Arc::new(OspfDissector::new(ospf_id)));
+    engine.register_dissector(Arc::new(Dhcpv6Dissector::new(dhcpv6_id)));
+    engine.register_dissector(Arc::new(Smb2Dissector::new(smb2_id)));
+    engine.register_dissector(Arc::new(GrpcDissector::new(grpc_id)));
+    engine.register_dissector(Arc::new(MqttDissector::new(mqtt_id)));
+    engine.register_dissector(Arc::new(ModbusTcpDissector::new(modbus_id)));
+
+    engine.register_table_entry(TableId::IpProto, 89, ospf_id);
+    engine.register_table_entry(TableId::UdpPort, 546, dhcpv6_id);
+    engine.register_table_entry(TableId::UdpPort, 547, dhcpv6_id);
+    engine.register_table_entry(TableId::TcpPort, 179, bgp_id);
+    engine.register_table_entry(TableId::TcpPort, 445, smb2_id);
+    engine.register_table_entry(TableId::TcpPort, 502, modbus_id);
+    engine.register_table_entry(TableId::TcpPort, 1883, mqtt_id);
+    engine.register_table_entry(TableId::TcpPort, 8883, mqtt_id);
+    engine.register_table_entry(TableId::TcpPort, 50051, grpc_id);
 }
 
 #[cfg(test)]
@@ -290,6 +322,58 @@ mod tests {
             .experts
             .iter()
             .any(|e| e.group == ExpertGroup::Malformed));
+    }
+
+    #[test]
+    fn dissect_bgp_mqtt_modbus_and_smb2() {
+        let engine = build_default_engine();
+        let mut resolver = NameResolver::new(ResolutionConfig::default());
+        let mut conv = ConversationTracker::new();
+
+        let make_tcp_frame = |dport: u16, payload: &[u8]| -> Frame {
+            let mut pkt = Vec::new();
+            pkt.extend_from_slice(&[0u8; 12]);
+            pkt.extend_from_slice(&0x0800u16.to_be_bytes());
+            let ip_total = (20 + 20 + payload.len()) as u16;
+            pkt.extend_from_slice(&[0x45, 0x00]);
+            pkt.extend_from_slice(&ip_total.to_be_bytes());
+            pkt.extend_from_slice(&[0, 1, 0, 0, 64, 6, 0, 0]);
+            pkt.extend_from_slice(&[10, 0, 0, 1, 10, 0, 0, 2]);
+            pkt.extend_from_slice(&40000u16.to_be_bytes());
+            pkt.extend_from_slice(&dport.to_be_bytes());
+            pkt.extend_from_slice(&1u32.to_be_bytes());
+            pkt.extend_from_slice(&1u32.to_be_bytes());
+            pkt.extend_from_slice(&0x5018u16.to_be_bytes());
+            pkt.extend_from_slice(&4096u16.to_be_bytes());
+            pkt.extend_from_slice(&[0, 0, 0, 0]);
+            pkt.extend_from_slice(payload);
+            Frame::new(1, Timestamp::ZERO, LinkType::Ethernet, pkt)
+        };
+
+        // 1. BGP OPEN
+        let mut bgp = vec![0xff; 16];
+        bgp.extend_from_slice(&29u16.to_be_bytes());
+        bgp.push(1); // OPEN
+        bgp.push(4); // v4
+        bgp.extend_from_slice(&65001u16.to_be_bytes());
+        bgp.extend_from_slice(&180u16.to_be_bytes());
+        bgp.extend_from_slice(&[192, 0, 2, 1]);
+        bgp.push(0);
+        let d_bgp = engine.dissect_frame(&make_tcp_frame(179, &bgp), None, None, &mut resolver, &mut conv);
+        assert_eq!(d_bgp.summary.protocol, "BGP");
+        assert!(d_bgp.summary.info.contains("AS65001"));
+
+        // 2. MQTT PUBLISH
+        let mqtt = [0x30, 0x0d, 0x00, 0x07, b's', b'e', b'n', b's', b'o', b'r', b's', b'2', b'5', b'C', b'!'];
+        let d_mqtt = engine.dissect_frame(&make_tcp_frame(1883, &mqtt), None, None, &mut resolver, &mut conv);
+        assert_eq!(d_mqtt.summary.protocol, "MQTT");
+        assert!(d_mqtt.summary.info.contains("sensors"));
+
+        // 3. Modbus/TCP Read Holding Registers (fc=3)
+        let modbus = [0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x6b, 0x00, 0x03];
+        let d_mb = engine.dissect_frame(&make_tcp_frame(502, &modbus), None, None, &mut resolver, &mut conv);
+        assert_eq!(d_mb.summary.protocol, "Modbus/TCP");
+        assert!(d_mb.summary.info.contains("Read Holding Registers"));
     }
 }
 

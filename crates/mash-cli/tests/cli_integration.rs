@@ -1,3 +1,4 @@
+use mash_cli::tui::TuiApp;
 use mash_cli::{
     apply_capture_edits, export_ek_lines, export_pdml, export_psml, format_fields_row, EditOptions,
 };
@@ -150,4 +151,45 @@ fn stateful_tcp_analyzer_detects_retransmission_dup_ack_and_zero_window() {
         flow.frame_anomalies.get(&5),
         Some(&vec![TcpAnomaly::ZeroWindow])
     );
+}
+
+#[test]
+fn tui_snapshot_and_anonymizer_edit_roundtrip() {
+    let hexdump = "0000  47 45 54 20 2f 73 65 63 72 65 74 20 48 54 54 50  GET /secret HTTP\n\
+                   0010  2f 31 2e 31 0d 0a 0d 0a                          /1.1....\n";
+    let t2p_opts = Text2PcapOptions {
+        prepend_tcp_ports: Some((54321, 80)),
+        ..Text2PcapOptions::default()
+    };
+    let frames = parse_hexdump_packets(hexdump, &t2p_opts);
+    let mut cap = CaptureFile::new(CaptureFormat::PcapNg);
+    cap.frames = frames;
+
+    let engine = build_default_engine();
+    let mut resolver = NameResolver::new(ResolutionConfig::default());
+    let mut conv = ConversationTracker::new();
+    let dissected: Vec<_> = cap
+        .frames
+        .iter()
+        .map(|f| engine.dissect_frame(f, None, None, &mut resolver, &mut conv))
+        .collect();
+
+    let mut tui = TuiApp::new("test.pcapng", cap.frames.clone(), dissected, None);
+    let snap = tui.render_snapshot(100);
+    assert!(snap.contains("MUNG-ASH TUI"));
+    assert!(snap.contains("GET /secret HTTP/1.1"));
+
+    tui.apply_filter("http", Some(&engine.registry));
+    assert_eq!(tui.filtered_indices.len(), 1);
+
+    // Anonymize IP/MAC and scrub payload
+    let edit_opts = EditOptions {
+        anonymize_key: Some("corp-key-123".to_string()),
+        scrub_payload: true,
+        ..EditOptions::default()
+    };
+    apply_capture_edits(&mut cap, &edit_opts);
+    let d_anon = engine.dissect_frame(&cap.frames[0], None, None, &mut resolver, &mut conv);
+    assert_ne!(d_anon.summary.source, "10.1.1.1");
+    assert!(d_anon.summary.source.starts_with("10."));
 }

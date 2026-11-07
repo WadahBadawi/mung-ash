@@ -1,6 +1,4 @@
-use mash_capture::{
-    list_capture_interfaces, synthesize_live_probe_frame, CaptureOptions, RingBufferWriter,
-};
+use mash_capture::{capture_frames, list_capture_interfaces, CaptureOptions, RingBufferWriter};
 use mash_pcapfile::CaptureFormat;
 use std::env;
 
@@ -128,7 +126,14 @@ fn main() {
     if opts.interfaces.is_empty() {
         opts.interfaces.push("eth0".to_string());
     }
-    let count = opts.max_packets.unwrap_or(10);
+    let frames = match capture_frames(&opts) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("mash-cap: capture error: {e}");
+            std::process::exit(1);
+        }
+    };
+    let count = frames.len();
     if let Some(path) = out_path {
         let mut writer = RingBufferWriter::new(
             &path,
@@ -136,12 +141,7 @@ fn main() {
             opts.ring_file_size_kb.or(opts.max_file_size_kb),
             opts.ring_max_files,
         );
-        for seq in 1..=count {
-            let mut frame = synthesize_live_probe_frame(seq);
-            if (frame.data.len() as u32) > opts.snap_len && opts.snap_len > 0 {
-                frame.data.truncate(opts.snap_len as usize);
-                frame.captured_len = frame.data.len() as u32;
-            }
+        for frame in frames {
             if let Err(e) = writer.push_frame(frame) {
                 eprintln!("mash-cap: write error: {e}");
                 std::process::exit(1);

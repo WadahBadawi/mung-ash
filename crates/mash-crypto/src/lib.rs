@@ -2,13 +2,17 @@ use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce as AesNonce};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce as ChaChaNonce};
 use hkdf::Hkdf;
-use mash_core::{MashError, Result};
+use hmac::{Hmac, Mac};
+use mash_core::{Frame, LinkType, MashError, Result};
 use sha2::{Sha256, Sha384};
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::Path;
 use zeroize::{Zeroize, ZeroizeOnDrop};
+
+type HmacSha256 = Hmac<Sha256>;
+type HmacSha384 = Hmac<Sha384>;
 
 /// Supported TLS 1.3 AEAD cipher suites (`CRY-02`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +44,46 @@ impl TlsCipherSuite {
 
     pub const fn iv_len(&self) -> usize {
         12
+    }
+}
+
+/// Supported TLS 1.2 AEAD cipher suites (`CRY-02`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tls12CipherSuite {
+    /// `0x009C`, `0xC02B`, `0xC02F`: AES-128-GCM with SHA-256
+    Aes128GcmSha256,
+    /// `0x009D`, `0xC02C`, `0xC030`: AES-256-GCM with SHA-384
+    Aes256GcmSha384,
+    /// `0xCCA8`, `0xCCA9`: ChaCha20-Poly1305 with SHA-256 (RFC 7905)
+    Chacha20Poly1305Sha256,
+}
+
+impl Tls12CipherSuite {
+    pub const fn from_u16(code: u16) -> Option<Self> {
+        match code {
+            0x009c | 0x009e | 0xc02b | 0xc02f => Some(Self::Aes128GcmSha256),
+            0x009d | 0x009f | 0xc02c | 0xc030 => Some(Self::Aes256GcmSha384),
+            0xcca8..=0xccaa => Some(Self::Chacha20Poly1305Sha256),
+            _ => None,
+        }
+    }
+
+    pub const fn key_len(&self) -> usize {
+        match self {
+            Self::Aes128GcmSha256 => 16,
+            Self::Aes256GcmSha384 | Self::Chacha20Poly1305Sha256 => 32,
+        }
+    }
+
+    pub const fn fixed_iv_len(&self) -> usize {
+        match self {
+            Self::Aes128GcmSha256 | Self::Aes256GcmSha384 => 4,
+            Self::Chacha20Poly1305Sha256 => 12,
+        }
+    }
+
+    pub const fn use_sha384(&self) -> bool {
+        matches!(self, Self::Aes256GcmSha384)
     }
 }
 
@@ -183,6 +227,220 @@ pub fn hkdf_expand_label(
     Ok(okm)
 }
 
+/// RFC 5246 Section 5 TLS 1.2 Pseudo-Random Function `PRF(secret, label, seed)`.
+pub fn tls12_prf(
+    secret: &[u8],
+    label: &[u8],
+    seed: &[u8],
+    use_sha384: bool,
+    out_len: usize,
+) -> Result<Vec<u8>> {
+    let mut label_seed = Vec::with_capacity(label.len() + seed.len());
+    label_seed.extend_from_slice(label);
+    label_seed.extend_from_slice(seed);
+
+    let mut out = Vec::with_capacity(out_len);
+    if use_sha384 {
+        let mut a = {
+            let mut mac = <HmacSha384 as Mac>::new_from_slice(secret)
+                .map_err(|e| MashError::Crypto(format!("HMAC-SHA384 init failed: {e}")))?;
+            mac.update(&label_seed);
+            mac.finalize().into_bytes().to_vec()
+        };
+        while out.len() < out_len {
+            let mut mac = <HmacSha384 as Mac>::new_from_slice(secret)
+                .map_err(|e| MashError::Crypto(format!("HMAC-SHA384 init failed: {e}")))?;
+            mac.update(&a);
+            mac.update(&label_seed);
+            let block = mac.finalize().into_bytes();
+            let take = (out_len - out.len()).min(block.len());
+            out.extend_from_slice(&block[..take]);
+
+            let mut next_a = <HmacSha384 as Mac>::new_from_slice(secret)
+                .map_err(|e| MashError::Crypto(format!("HMAC-SHA384 init failed: {e}")))?;
+            next_a.update(&a);
+            a = next_a.finalize().into_bytes().to_vec();
+        }
+    } else {
+        let mut a = {
+            let mut mac = <HmacSha256 as Mac>::new_from_slice(secret)
+                .map_err(|e| MashError::Crypto(format!("HMAC-SHA256 init failed: {e}")))?;
+            mac.update(&label_seed);
+            mac.finalize().into_bytes().to_vec()
+        };
+        while out.len() < out_len {
+            let mut mac = <HmacSha256 as Mac>::new_from_slice(secret)
+                .map_err(|e| MashError::Crypto(format!("HMAC-SHA256 init failed: {e}")))?;
+            mac.update(&a);
+            mac.update(&label_seed);
+            let block = mac.finalize().into_bytes();
+            let take = (out_len - out.len()).min(block.len());
+            out.extend_from_slice(&block[..take]);
+
+            let mut next_a = <HmacSha256 as Mac>::new_from_slice(secret)
+                .map_err(|e| MashError::Crypto(format!("HMAC-SHA256 init failed: {e}")))?;
+            next_a.update(&a);
+            a = next_a.finalize().into_bytes().to_vec();
+        }
+    }
+    Ok(out)
+}
+
+/// Derived TLS 1.2 bidirectional AEAD keys and implicit IVs (`CRY-02`).
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct Tls12TrafficKeys {
+    #[zeroize(skip)]
+    pub suite: Tls12CipherSuite,
+    pub client_write_key: Vec<u8>,
+    pub server_write_key: Vec<u8>,
+    pub client_write_iv: Vec<u8>,
+    pub server_write_iv: Vec<u8>,
+}
+
+impl fmt::Debug for Tls12TrafficKeys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Tls12TrafficKeys")
+            .field("suite", &self.suite)
+            .field("keys", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Tls12TrafficKeys {
+    /// Derive TLS 1.2 key block from `master_secret`, `client_random`, and `server_random` per RFC 5246 Section 6.3.
+    pub fn from_master_secret(
+        suite: Tls12CipherSuite,
+        master_secret: &[u8],
+        client_random: &[u8; 32],
+        server_random: &[u8; 32],
+    ) -> Result<Self> {
+        let mut seed = [0u8; 64];
+        seed[..32].copy_from_slice(server_random);
+        seed[32..].copy_from_slice(client_random);
+
+        let key_len = suite.key_len();
+        let iv_len = suite.fixed_iv_len();
+        let total = 2 * key_len + 2 * iv_len;
+        let key_block = tls12_prf(
+            master_secret,
+            b"key expansion",
+            &seed,
+            suite.use_sha384(),
+            total,
+        )?;
+
+        let client_write_key = key_block[0..key_len].to_vec();
+        let server_write_key = key_block[key_len..2 * key_len].to_vec();
+        let client_write_iv = key_block[2 * key_len..2 * key_len + iv_len].to_vec();
+        let server_write_iv = key_block[2 * key_len + iv_len..total].to_vec();
+
+        Ok(Self {
+            suite,
+            client_write_key,
+            server_write_key,
+            client_write_iv,
+            server_write_iv,
+        })
+    }
+
+    /// Decrypt a TLS 1.2 AEAD record.
+    /// For AES-GCM, `record_body` starts with an 8-byte explicit nonce followed by ciphertext + 16-byte tag.
+    /// For ChaCha20-Poly1305 (RFC 7905), `record_body` is ciphertext + 16-byte tag with no explicit nonce.
+    pub fn decrypt_record(
+        &self,
+        is_from_client: bool,
+        seq_num: u64,
+        content_type: u8,
+        version: u16,
+        record_body: &[u8],
+    ) -> Result<Vec<u8>> {
+        let (key, fixed_iv) = if is_from_client {
+            (&self.client_write_key, &self.client_write_iv)
+        } else {
+            (&self.server_write_key, &self.server_write_iv)
+        };
+
+        match self.suite {
+            Tls12CipherSuite::Aes128GcmSha256 | Tls12CipherSuite::Aes256GcmSha384 => {
+                if record_body.len() < 8 + 16 {
+                    return Err(MashError::Crypto(
+                        "TLS 1.2 AES-GCM record too short".to_string(),
+                    ));
+                }
+                let explicit_nonce = &record_body[..8];
+                let ciphertext = &record_body[8..];
+                let plain_len = (ciphertext.len() - 16) as u16;
+
+                let mut nonce = [0u8; 12];
+                nonce[..4].copy_from_slice(fixed_iv);
+                nonce[4..].copy_from_slice(explicit_nonce);
+
+                let mut aad = [0u8; 13];
+                aad[..8].copy_from_slice(&seq_num.to_be_bytes());
+                aad[8] = content_type;
+                aad[9..11].copy_from_slice(&version.to_be_bytes());
+                aad[11..13].copy_from_slice(&plain_len.to_be_bytes());
+
+                let payload = Payload {
+                    msg: ciphertext,
+                    aad: &aad,
+                };
+                if self.suite == Tls12CipherSuite::Aes128GcmSha256 {
+                    let cipher = Aes128Gcm::new_from_slice(key)
+                        .map_err(|e| MashError::Crypto(format!("AES-128-GCM init error: {e}")))?;
+                    cipher
+                        .decrypt(AesNonce::from_slice(&nonce), payload)
+                        .map_err(|_| {
+                            MashError::Crypto("TLS 1.2 AES-128-GCM tag mismatch".to_string())
+                        })
+                } else {
+                    let cipher = Aes256Gcm::new_from_slice(key)
+                        .map_err(|e| MashError::Crypto(format!("AES-256-GCM init error: {e}")))?;
+                    cipher
+                        .decrypt(AesNonce::from_slice(&nonce), payload)
+                        .map_err(|_| {
+                            MashError::Crypto("TLS 1.2 AES-256-GCM tag mismatch".to_string())
+                        })
+                }
+            }
+            Tls12CipherSuite::Chacha20Poly1305Sha256 => {
+                if record_body.len() < 16 {
+                    return Err(MashError::Crypto(
+                        "TLS 1.2 ChaCha20-Poly1305 record too short".to_string(),
+                    ));
+                }
+                let plain_len = (record_body.len() - 16) as u16;
+                let mut nonce = [0u8; 12];
+                nonce.copy_from_slice(fixed_iv);
+                let seq_bytes = seq_num.to_be_bytes();
+                for i in 0..8 {
+                    nonce[4 + i] ^= seq_bytes[i];
+                }
+
+                let mut aad = [0u8; 13];
+                aad[..8].copy_from_slice(&seq_num.to_be_bytes());
+                aad[8] = content_type;
+                aad[9..11].copy_from_slice(&version.to_be_bytes());
+                aad[11..13].copy_from_slice(&plain_len.to_be_bytes());
+
+                let cipher = ChaCha20Poly1305::new_from_slice(key)
+                    .map_err(|e| MashError::Crypto(format!("ChaCha20-Poly1305 init error: {e}")))?;
+                cipher
+                    .decrypt(
+                        ChaChaNonce::from_slice(&nonce),
+                        Payload {
+                            msg: record_body,
+                            aad: &aad,
+                        },
+                    )
+                    .map_err(|_| {
+                        MashError::Crypto("TLS 1.2 ChaCha20-Poly1305 tag mismatch".to_string())
+                    })
+            }
+        }
+    }
+}
+
 /// Derived directional TLS 1.3 AEAD key and 12-byte IV (`CRY-02`, `REL-05`).
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct Tls13TrafficKeys {
@@ -274,6 +532,343 @@ impl Tls13TrafficKeys {
     }
 }
 
+/// Decrypted TLS record output (`CRY-02`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecryptedTlsRecord {
+    pub record_index: usize,
+    pub inner_content_type: u8,
+    pub plaintext: Vec<u8>,
+}
+
+/// Stateful per-stream TLS handshake & record decryptor (`CRY-01`, `CRY-02`).
+#[derive(Debug, Clone, Default)]
+pub struct TlsStreamDecryptor {
+    pub client_endpoint: Option<(String, u16)>,
+    pub client_random: Option<[u8; 32]>,
+    pub server_random: Option<[u8; 32]>,
+    pub cipher_suite_code: Option<u16>,
+    pub client_seq: u64,
+    pub server_seq: u64,
+    pub tls13_client_app_keys: Option<Tls13TrafficKeys>,
+    pub tls13_server_app_keys: Option<Tls13TrafficKeys>,
+    pub tls12_keys: Option<Tls12TrafficKeys>,
+}
+
+impl TlsStreamDecryptor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Process a TCP payload containing one or more TLS records, updating handshake parameters
+    /// and returning any successfully decrypted `ApplicationData` records.
+    pub fn process_tcp_payload(
+        &mut self,
+        src_addr: &str,
+        src_port: u16,
+        payload: &[u8],
+        keystore: &TlsKeyStore,
+    ) -> Vec<DecryptedTlsRecord> {
+        let mut results = Vec::new();
+        let mut offset = 0usize;
+        let mut rec_idx = 0usize;
+
+        while offset + 5 <= payload.len() {
+            let content_type = payload[offset];
+            let version = u16::from_be_bytes([payload[offset + 1], payload[offset + 2]]);
+            let rec_len = u16::from_be_bytes([payload[offset + 3], payload[offset + 4]]) as usize;
+            let Some(body) = payload.get(offset + 5..offset + 5 + rec_len) else {
+                break;
+            };
+            let hdr: [u8; 5] = [
+                payload[offset],
+                payload[offset + 1],
+                payload[offset + 2],
+                payload[offset + 3],
+                payload[offset + 4],
+            ];
+
+            if content_type == 22 && body.len() >= 38 {
+                let hs_type = body[0];
+                // Handshake header: 1 byte type + 3 bytes length + 2 bytes version + 32 bytes random
+                if hs_type == 1 {
+                    // ClientHello
+                    let mut cr = [0u8; 32];
+                    cr.copy_from_slice(&body[6..38]);
+                    self.client_random = Some(cr);
+                    self.client_endpoint = Some((src_addr.to_string(), src_port));
+                    self.try_derive_keys(keystore);
+                } else if hs_type == 2 {
+                    // ServerHello
+                    let mut sr = [0u8; 32];
+                    sr.copy_from_slice(&body[6..38]);
+                    self.server_random = Some(sr);
+                    if let Some(&sid_len) = body.get(38) {
+                        let cs_off = 39 + sid_len as usize;
+                        if let Some(cs_bytes) = body.get(cs_off..cs_off + 2) {
+                            self.cipher_suite_code =
+                                Some(u16::from_be_bytes([cs_bytes[0], cs_bytes[1]]));
+                        }
+                    }
+                    self.try_derive_keys(keystore);
+                }
+            } else if content_type == 23 {
+                let is_client = self
+                    .client_endpoint
+                    .as_ref()
+                    .map(|(a, p)| a == src_addr && *p == src_port)
+                    .unwrap_or(true);
+
+                if is_client {
+                    let seq = self.client_seq;
+                    if let Some(keys) = &self.tls13_client_app_keys {
+                        if let Ok((inner_ct, plain)) = keys.decrypt_record(seq, hdr, body) {
+                            self.client_seq += 1;
+                            results.push(DecryptedTlsRecord {
+                                record_index: rec_idx,
+                                inner_content_type: inner_ct,
+                                plaintext: plain,
+                            });
+                        }
+                    } else if let Some(keys12) = &self.tls12_keys {
+                        if let Ok(plain) =
+                            keys12.decrypt_record(true, seq, content_type, version, body)
+                        {
+                            self.client_seq += 1;
+                            results.push(DecryptedTlsRecord {
+                                record_index: rec_idx,
+                                inner_content_type: 23,
+                                plaintext: plain,
+                            });
+                        }
+                    }
+                } else {
+                    let seq = self.server_seq;
+                    if let Some(keys) = &self.tls13_server_app_keys {
+                        if let Ok((inner_ct, plain)) = keys.decrypt_record(seq, hdr, body) {
+                            self.server_seq += 1;
+                            results.push(DecryptedTlsRecord {
+                                record_index: rec_idx,
+                                inner_content_type: inner_ct,
+                                plaintext: plain,
+                            });
+                        }
+                    } else if let Some(keys12) = &self.tls12_keys {
+                        if let Ok(plain) =
+                            keys12.decrypt_record(false, seq, content_type, version, body)
+                        {
+                            self.server_seq += 1;
+                            results.push(DecryptedTlsRecord {
+                                record_index: rec_idx,
+                                inner_content_type: 23,
+                                plaintext: plain,
+                            });
+                        }
+                    }
+                }
+            }
+
+            offset += 5 + rec_len;
+            rec_idx += 1;
+        }
+
+        results
+    }
+
+    fn try_derive_keys(&mut self, keystore: &TlsKeyStore) {
+        let Some(cr) = &self.client_random else {
+            return;
+        };
+        let Some(secrets) = keystore.get(cr) else {
+            return;
+        };
+        let cs_code = self.cipher_suite_code.unwrap_or(0x1301);
+
+        if let Some(suite13) = TlsCipherSuite::from_u16(cs_code) {
+            if self.tls13_client_app_keys.is_none() {
+                if let Some(sec) = &secrets.client_traffic_secret_0 {
+                    self.tls13_client_app_keys =
+                        Tls13TrafficKeys::from_traffic_secret(suite13, &sec.0).ok();
+                }
+            }
+            if self.tls13_server_app_keys.is_none() {
+                if let Some(sec) = &secrets.server_traffic_secret_0 {
+                    self.tls13_server_app_keys =
+                        Tls13TrafficKeys::from_traffic_secret(suite13, &sec.0).ok();
+                }
+            }
+        } else if let (Some(suite12), Some(sr), Some(ms)) = (
+            Tls12CipherSuite::from_u16(cs_code),
+            &self.server_random,
+            &secrets.master_secret,
+        ) {
+            if self.tls12_keys.is_none() {
+                self.tls12_keys =
+                    Tls12TrafficKeys::from_master_secret(suite12, &ms.0, cr, sr).ok();
+            }
+        }
+    }
+}
+
+/// Keyed packet anonymizer for scrubbing MACs, IPv4/IPv6 addresses, and L4 payloads (`CRY-03`).
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct PcapAnonymizer {
+    key: [u8; 32],
+    #[zeroize(skip)]
+    pub preserve_mac_oui: bool,
+    #[zeroize(skip)]
+    pub scrub_payload: bool,
+}
+
+impl PcapAnonymizer {
+    pub fn new(passphrase: &str, preserve_mac_oui: bool, scrub_payload: bool) -> Self {
+        let mut mac =
+            <HmacSha256 as Mac>::new_from_slice(b"mash-pcap-anonymizer-v1").expect("HMAC key init");
+        mac.update(passphrase.as_bytes());
+        let bytes = mac.finalize().into_bytes();
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes);
+        Self {
+            key,
+            preserve_mac_oui,
+            scrub_payload,
+        }
+    }
+
+    /// Pseudonymize a 6-byte Ethernet MAC address consistently.
+    pub fn anonymize_mac(&self, mac_addr: [u8; 6]) -> [u8; 6] {
+        if mac_addr == [0xff; 6] || mac_addr == [0x00; 6] {
+            return mac_addr;
+        }
+        let digest = self.prf_tag(b"mac", &mac_addr);
+        let mut out = mac_addr;
+        if self.preserve_mac_oui {
+            out[3] = digest[0];
+            out[4] = digest[1];
+            out[5] = digest[2];
+        } else {
+            out[0] = (digest[0] & 0xfe) | 0x02; // locally administered unicast
+            out[1] = digest[1];
+            out[2] = digest[2];
+            out[3] = digest[3];
+            out[4] = digest[4];
+            out[5] = digest[5];
+        }
+        out
+    }
+
+    /// Pseudonymize an IPv4 address while preserving `/24` subnet grouping.
+    pub fn anonymize_ipv4(&self, ip: [u8; 4]) -> [u8; 4] {
+        if ip == [127, 0, 0, 1] || ip == [255, 255, 255, 255] || ip == [0, 0, 0, 0] {
+            return ip;
+        }
+        let net_tag = self.prf_tag(b"ipv4-net24", &ip[..3]);
+        let host_tag = self.prf_tag(b"ipv4-host", &ip);
+        [
+            10,
+            net_tag[0],
+            net_tag[1],
+            host_tag[0].clamp(1, 254),
+        ]
+    }
+
+    /// Pseudonymize an IPv6 address into the `fd00::/8` ULA range while preserving `/64` prefix grouping.
+    pub fn anonymize_ipv6(&self, ip: [u8; 16]) -> [u8; 16] {
+        let pfx = self.prf_tag(b"ipv6-pfx64", &ip[..8]);
+        let iid = self.prf_tag(b"ipv6-iid64", &ip);
+        let mut out = [0u8; 16];
+        out[0] = 0xfd;
+        out[1..8].copy_from_slice(&pfx[..7]);
+        out[8..16].copy_from_slice(&iid[..8]);
+        out
+    }
+
+    /// Anonymize a `Frame` in-place (Ethernet MACs, IPv4/IPv6 addresses, ARP addresses, and optional payload scrubbing).
+    pub fn anonymize_frame(&self, frame: &mut Frame) {
+        if frame.link_type != LinkType::Ethernet || frame.data.len() < 14 {
+            return;
+        }
+        let mut dst_mac = [0u8; 6];
+        let mut src_mac = [0u8; 6];
+        dst_mac.copy_from_slice(&frame.data[0..6]);
+        src_mac.copy_from_slice(&frame.data[6..12]);
+        frame.data[0..6].copy_from_slice(&self.anonymize_mac(dst_mac));
+        frame.data[6..12].copy_from_slice(&self.anonymize_mac(src_mac));
+
+        let mut ethertype = u16::from_be_bytes([frame.data[12], frame.data[13]]);
+        let mut l3_off = 14usize;
+        if (ethertype == 0x8100 || ethertype == 0x88a8) && frame.data.len() >= 18 {
+            ethertype = u16::from_be_bytes([frame.data[16], frame.data[17]]);
+            l3_off = 18;
+        }
+
+        match ethertype {
+            0x0800 if frame.data.len() >= l3_off + 20 => {
+                let ihl = ((frame.data[l3_off] & 0x0f) as usize) * 4;
+                let proto = frame.data[l3_off + 9];
+                let mut src_ip = [0u8; 4];
+                let mut dst_ip = [0u8; 4];
+                src_ip.copy_from_slice(&frame.data[l3_off + 12..l3_off + 16]);
+                dst_ip.copy_from_slice(&frame.data[l3_off + 16..l3_off + 20]);
+                frame.data[l3_off + 12..l3_off + 16]
+                    .copy_from_slice(&self.anonymize_ipv4(src_ip));
+                frame.data[l3_off + 16..l3_off + 20]
+                    .copy_from_slice(&self.anonymize_ipv4(dst_ip));
+
+                if self.scrub_payload {
+                    let l4_off = l3_off + ihl.max(20);
+                    let payload_off = match proto {
+                        6 if frame.data.len() >= l4_off + 20 => {
+                            let tcp_hdr_len = ((frame.data[l4_off + 12] >> 4) as usize) * 4;
+                            l4_off + tcp_hdr_len.max(20)
+                        }
+                        17 => l4_off + 8,
+                        _ => l4_off,
+                    };
+                    if payload_off < frame.data.len() {
+                        frame.data[payload_off..].fill(0);
+                    }
+                }
+            }
+            0x86dd if frame.data.len() >= l3_off + 40 => {
+                let mut src_ip6 = [0u8; 16];
+                let mut dst_ip6 = [0u8; 16];
+                src_ip6.copy_from_slice(&frame.data[l3_off + 8..l3_off + 24]);
+                dst_ip6.copy_from_slice(&frame.data[l3_off + 24..l3_off + 40]);
+                frame.data[l3_off + 8..l3_off + 24]
+                    .copy_from_slice(&self.anonymize_ipv6(src_ip6));
+                frame.data[l3_off + 24..l3_off + 40]
+                    .copy_from_slice(&self.anonymize_ipv6(dst_ip6));
+            }
+            0x0806 if frame.data.len() >= l3_off + 28 => {
+                // Ethernet + IPv4 ARP
+                let mut sha = [0u8; 6];
+                let mut spa = [0u8; 4];
+                let mut tha = [0u8; 6];
+                let mut tpa = [0u8; 4];
+                sha.copy_from_slice(&frame.data[l3_off + 8..l3_off + 14]);
+                spa.copy_from_slice(&frame.data[l3_off + 14..l3_off + 18]);
+                tha.copy_from_slice(&frame.data[l3_off + 18..l3_off + 24]);
+                tpa.copy_from_slice(&frame.data[l3_off + 24..l3_off + 28]);
+                frame.data[l3_off + 8..l3_off + 14].copy_from_slice(&self.anonymize_mac(sha));
+                frame.data[l3_off + 14..l3_off + 18].copy_from_slice(&self.anonymize_ipv4(spa));
+                frame.data[l3_off + 18..l3_off + 24].copy_from_slice(&self.anonymize_mac(tha));
+                frame.data[l3_off + 24..l3_off + 28].copy_from_slice(&self.anonymize_ipv4(tpa));
+            }
+            _ => {}
+        }
+    }
+
+    fn prf_tag(&self, domain: &[u8], data: &[u8]) -> [u8; 32] {
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(&self.key).expect("HMAC init");
+        mac.update(domain);
+        mac.update(data);
+        let bytes = mac.finalize().into_bytes();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&bytes);
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,5 +920,62 @@ mod tests {
         let dbg = format!("{keys:?}");
         assert!(dbg.contains("REDACTED"));
     }
-}
 
+    #[test]
+    fn tls12_prf_and_aes_gcm_decryption_roundtrip() {
+        let cr = [0x11u8; 32];
+        let sr = [0x22u8; 32];
+        let master = [0x33u8; 48];
+        let keys = Tls12TrafficKeys::from_master_secret(
+            Tls12CipherSuite::Aes128GcmSha256,
+            &master,
+            &cr,
+            &sr,
+        )
+        .unwrap();
+
+        let explicit_nonce = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        let mut nonce = [0u8; 12];
+        nonce[..4].copy_from_slice(&keys.client_write_iv);
+        nonce[4..].copy_from_slice(&explicit_nonce);
+
+        let plaintext = b"HTTP/1.1 200 OK\r\n\r\n";
+        let seq_num = 0u64;
+        let mut aad = [0u8; 13];
+        aad[..8].copy_from_slice(&seq_num.to_be_bytes());
+        aad[8] = 23;
+        aad[9..11].copy_from_slice(&0x0303u16.to_be_bytes());
+        aad[11..13].copy_from_slice(&(plaintext.len() as u16).to_be_bytes());
+
+        let cipher = Aes128Gcm::new_from_slice(&keys.client_write_key).unwrap();
+        let ct = cipher
+            .encrypt(
+                AesNonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: &aad,
+                },
+            )
+            .unwrap();
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&explicit_nonce);
+        body.extend_from_slice(&ct);
+
+        let dec = keys.decrypt_record(true, seq_num, 23, 0x0303, &body).unwrap();
+        assert_eq!(dec, plaintext);
+    }
+
+    #[test]
+    fn pcap_anonymizer_preserves_subnet_consistency() {
+        let anon = PcapAnonymizer::new("secret-key", true, false);
+        let a1 = anon.anonymize_ipv4([192, 168, 10, 5]);
+        let a2 = anon.anonymize_ipv4([192, 168, 10, 99]);
+        assert_eq!(a1[..3], a2[..3]);
+        assert_ne!(a1[3], a2[3]);
+
+        let mac = anon.anonymize_mac([0x00, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e]);
+        assert_eq!(&mac[..3], &[0x00, 0x1a, 0x2b]);
+        assert_ne!(&mac[3..], &[0x3c, 0x4d, 0x5e]);
+    }
+}

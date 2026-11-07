@@ -1,4 +1,7 @@
+pub mod tui;
+
 use mash_core::{DissectedPacket, FieldTree, Frame, NodeId, Timestamp};
+use mash_crypto::PcapAnonymizer;
 use mash_pcapfile::CaptureFile;
 use serde_json::json;
 use std::collections::VecDeque;
@@ -182,6 +185,8 @@ pub struct EditOptions {
     pub deduplicate_window: Option<usize>,
     pub frame_ranges: Vec<(u64, u64)>,
     pub comments: Vec<(u64, String)>,
+    pub anonymize_key: Option<String>,
+    pub scrub_payload: bool,
 }
 
 /// Apply `EditOptions` to a `CaptureFile` (`CLI-03`).
@@ -219,9 +224,17 @@ pub fn apply_capture_edits(cap: &mut CaptureFile, opts: &EditOptions) {
         .map(|s| (s * 1_000_000_000.0) as i128)
         .unwrap_or(0);
 
+    let anonymizer = opts
+        .anonymize_key
+        .as_deref()
+        .map(|k| PcapAnonymizer::new(k, true, opts.scrub_payload));
+
     for (idx, frame) in cap.frames.iter_mut().enumerate() {
         let orig_no = frame.number;
         frame.number = (idx + 1) as u64;
+        if let Some(anon) = &anonymizer {
+            anon.anonymize_frame(frame);
+        }
         if shift_nanos != 0 {
             frame.timestamp = Timestamp::from_nanos(frame.timestamp.nanos.saturating_add(shift_nanos));
         }

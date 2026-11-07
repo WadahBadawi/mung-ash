@@ -23,7 +23,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["MUNG-ASH Contributors"]
-repository = "https://github.com/storytold/mung-ash"
+repository = "https://github.com/WadahBadawi/mung-ash"
 
 [workspace.dependencies]
 mash-core = { path = "crates/mash-core" }

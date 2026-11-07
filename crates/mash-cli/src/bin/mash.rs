@@ -2,13 +2,16 @@ use mash_ai::{
     AiEngine, AiPrivacyPolicy, BuiltInHeuristicProvider, ConfigurableProvider, LlmProvider,
     PayloadScope,
 };
-use mash_capture::list_capture_interfaces;
+use mash_capture::{capture_frames, list_capture_interfaces, CaptureOptions};
+use mash_cli::tui::TuiApp;
 use mash_cli::{
     export_ek_lines, export_pdml, export_psml, format_fields_row, format_hexdump,
     format_summary_line, format_tree_text,
 };
-use mash_core::{NameResolver, ResolutionConfig};
-use mash_crypto::TlsKeyStore;
+use mash_core::{
+    ByteRange, FieldId, FieldType, FieldValue, NameResolver, ProtocolId, ResolutionConfig,
+};
+use mash_crypto::{TlsKeyStore, TlsStreamDecryptor};
 use mash_dissect::ConversationTracker;
 use mash_filter::CompiledFilter;
 use mash_pcapfile::{write_capture_file, CaptureFile, CaptureFormat};
@@ -30,9 +33,14 @@ fn print_help() {
     println!("Usage: mash [OPTIONS]");
     println!("Capture & File I/O:");
     println!("  -D                              List available capture interfaces");
+    println!("  -i <interface>                  Capture live packets from interface (or udp://host:port)");
+    println!("  -f <bpf-filter>                 Capture-time BPF filter expression");
+    println!("  -c <count>                      Stop after capturing <count> packets");
     println!("  -r <infile>                     Read packets from capture file (.pcap/.pcapng/.gz/.lz4)");
     println!("  -w <outfile>                    Write filtered packets to output file");
     println!("  -F <pcap|pcapng>                Output capture file format (default: pcapng)");
+    println!("  --tui                           Launch interactive 3-pane terminal UI");
+    println!("  --tui-once                      Render single 3-pane TUI frame to stdout and exit");
     println!("Filtering & Dissection:");
     println!("  -Y, -R <display-filter>         Apply display/read filter expression");
     println!("  -d <selector>,<proto>           Decode As override (e.g. tcp.port==8443,http)");
@@ -68,6 +76,11 @@ fn main() {
 
     let mut engine = build_default_engine();
     let mut read_path: Option<String> = None;
+    let mut live_iface: Option<String> = None;
+    let mut live_bpf: Option<String> = None;
+    let mut live_count: Option<u64> = None;
+    let mut tui_mode = false;
+    let mut tui_once = false;
     let mut write_path: Option<String> = None;
     let mut out_format: Option<CaptureFormat> = None;
     let mut filter_str: Option<String> = None;
@@ -130,6 +143,29 @@ fn main() {
                     continue;
                 }
             }
+            "-i" => {
+                if let Some(ifc) = args.get(i + 1) {
+                    live_iface = Some(ifc.clone());
+                    i += 2;
+                    continue;
+                }
+            }
+            "-f" => {
+                if let Some(bpf) = args.get(i + 1) {
+                    live_bpf = Some(bpf.clone());
+                    i += 2;
+                    continue;
+                }
+            }
+            "-c" => {
+                if let Some(cnt) = args.get(i + 1).and_then(|s| s.parse::<u64>().ok()) {
+                    live_count = Some(cnt);
+                    i += 2;
+                    continue;
+                }
+            }
+            "--tui" => tui_mode = true,
+            "--tui-once" => tui_once = true,
             "-w" => {
                 if let Some(p) = args.get(i + 1) {
                     write_path = Some(p.clone());
@@ -336,24 +372,42 @@ fn main() {
         None => CompiledFilter::compile("", None).unwrap(),
     };
 
-    let Some(infile) = read_path else {
-        eprintln!("mash: no input file specified (use -r <file> or --help)");
+    let (cap, raw_bytes_opt, source_title) = if let Some(infile) = read_path {
+        let raw_bytes = match fs::read(&infile) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("mash: failed to read '{infile}': {e}");
+                std::process::exit(1);
+            }
+        };
+        let c = match mash_pcapfile::read_capture_bytes(&raw_bytes) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("mash: invalid capture file '{infile}': {e}");
+                std::process::exit(1);
+            }
+        };
+        (c, Some(raw_bytes), infile)
+    } else if let Some(iface) = live_iface {
+        let opts = CaptureOptions {
+            interfaces: vec![iface.clone()],
+            bpf_filter: live_bpf,
+            max_packets: Some(live_count.unwrap_or(10)),
+            ..CaptureOptions::default()
+        };
+        let frames = match capture_frames(&opts) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("mash: live capture failed on '{iface}': {e}");
+                std::process::exit(1);
+            }
+        };
+        let mut c = CaptureFile::new(CaptureFormat::PcapNg);
+        c.frames = frames;
+        (c, None, format!("live:{iface}"))
+    } else {
+        eprintln!("mash: no input file or interface specified (use -r <file>, -i <iface>, or --help)");
         std::process::exit(1);
-    };
-
-    let raw_bytes = match fs::read(&infile) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("mash: failed to read '{infile}': {e}");
-            std::process::exit(1);
-        }
-    };
-    let cap = match mash_pcapfile::read_capture_bytes(&raw_bytes) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("mash: invalid capture file '{infile}': {e}");
-            std::process::exit(1);
-        }
     };
 
     for warn in &cap.warnings {
@@ -377,18 +431,26 @@ fn main() {
     let mut all_dissected = Vec::with_capacity(cap.frames.len());
     let mut tcp_streams: BTreeMap<u32, ReassembledStream> = BTreeMap::new();
     let mut udp_streams: BTreeMap<u32, ReassembledStream> = BTreeMap::new();
+    let mut tls_decryptors: BTreeMap<u32, TlsStreamDecryptor> = BTreeMap::new();
 
     for frame in &cap.frames {
-        let pkt = engine.dissect_frame(frame, first_ts, prev_ts, &mut resolver, &mut conv);
+        let mut pkt = engine.dissect_frame(frame, first_ts, prev_ts, &mut resolver, &mut conv);
         prev_ts = Some(frame.timestamp);
 
-        if let Some(sid) = pkt
+        let tcp_sid = pkt
             .tree
             .by_abbrev("tcp.stream")
             .next()
             .and_then(|n| n.value.as_u64())
-            .map(|v| v as u32)
-        {
+            .map(|v| v as u32);
+        let udp_sid = pkt
+            .tree
+            .by_abbrev("udp.stream")
+            .next()
+            .and_then(|n| n.value.as_u64())
+            .map(|v| v as u32);
+
+        if let Some(sid) = tcp_sid {
             let sport = pkt
                 .tree
                 .by_abbrev("tcp.srcport")
@@ -430,13 +492,50 @@ fn main() {
                     (flags & 0x02) != 0,
                     payload,
                 );
-        } else if let Some(sid) = pkt
-            .tree
-            .by_abbrev("udp.stream")
-            .next()
-            .and_then(|n| n.value.as_u64())
-            .map(|v| v as u32)
-        {
+
+            if !tls_keys.is_empty() && !payload.is_empty() {
+                let dec_records = tls_decryptors
+                    .entry(sid)
+                    .or_default()
+                    .process_tcp_payload(&pkt.summary.source, sport, payload, &tls_keys);
+                for rec in dec_records {
+                    let preview = String::from_utf8_lossy(&rec.plaintext)
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    let label = format!(
+                        "Decrypted TLS Record #{} (type={}, {} bytes): {}",
+                        rec.record_index,
+                        rec.inner_content_type,
+                        rec.plaintext.len(),
+                        preview
+                    );
+                    let (tls_root, tls_pid) = pkt
+                        .tree
+                        .by_abbrev("tls")
+                        .next()
+                        .map(|n| (Some(n.id), n.protocol_id))
+                        .unwrap_or((None, ProtocolId(0)));
+                    let _ = pkt.tree.add_node(
+                        tls_root,
+                        FieldId(0),
+                        tls_pid,
+                        "tls.decrypted.data",
+                        "Decrypted TLS Data",
+                        label,
+                        FieldType::Bytes,
+                        FieldValue::Bytes(rec.plaintext),
+                        ByteRange::new(payload_start, frame.data.len()),
+                        true,
+                    );
+                    if !preview.is_empty() {
+                        pkt.summary.info = format!("{} [Decrypted: {preview}]", pkt.summary.info);
+                    }
+                }
+            }
+        } else if let Some(sid) = udp_sid {
             let sport = pkt
                 .tree
                 .by_abbrev("udp.srcport")
@@ -484,7 +583,7 @@ fn main() {
     if let Some(out_file) = &write_path {
         let mut out_cap = CaptureFile::new(out_format.unwrap_or(cap.format));
         out_cap.interfaces = cap.interfaces.clone();
-        out_cap.frames = matched_frames;
+        out_cap.frames = matched_frames.clone();
         if let Err(e) = write_capture_file(out_file, &out_cap) {
             eprintln!("mash: failed to write '{out_file}': {e}");
             std::process::exit(1);
@@ -522,13 +621,29 @@ fn main() {
 
     // Handle `--ai-summary`
     if ai_summary {
-        let props = CaptureProperties::from_capture(&cap, Some(&raw_bytes));
+        let props = CaptureProperties::from_capture(&cap, raw_bytes_opt.as_deref());
         match ai_engine.summarize_capture(&props, &matched_packets) {
             Ok(text) => println!("{text}"),
             Err(e) => {
                 eprintln!("mash: AI error: {e}");
                 std::process::exit(1);
             }
+        }
+        return;
+    }
+
+    // Handle `--tui` / `--tui-once`
+    if tui_once || tui_mode {
+        let mut app = TuiApp::new(
+            source_title,
+            matched_frames,
+            matched_packets,
+            filter_str.clone(),
+        );
+        if tui_once {
+            print!("{}", app.render_snapshot(100));
+        } else {
+            app.run_interactive(&engine.registry);
         }
         return;
     }

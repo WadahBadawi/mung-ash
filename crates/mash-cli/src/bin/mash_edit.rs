@@ -13,6 +13,8 @@ fn print_help() {
     println!("  -D <window>           Remove duplicate packets within <window> frames");
     println!("  -c <pkts-per-file>    Split output into files of <pkts-per-file> packets");
     println!("  -a <frame>:<comment>  Attach a comment to <frame>");
+    println!("  --anonymize <key>     Pseudonymize MAC and IPv4/IPv6 addresses using HMAC key");
+    println!("  --scrub-payload       Zero out L4 payloads during anonymization");
     println!("  -F <pcap|pcapng>      Output file format");
 }
 
@@ -81,6 +83,16 @@ fn main() {
                     i += 2;
                     continue;
                 }
+            }
+            "--anonymize" => {
+                if let Some(k) = args.get(i + 1) {
+                    opts.anonymize_key = Some(k.clone());
+                    i += 2;
+                    continue;
+                }
+            }
+            "--scrub-payload" => {
+                opts.scrub_payload = true;
             }
             other => positional.push(other.to_string()),
         }
