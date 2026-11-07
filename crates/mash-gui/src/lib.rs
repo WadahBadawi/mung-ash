@@ -811,4 +811,62 @@ mod tests {
             assert!(!pkt.summary.info.contains("Malformed"));
         }
     }
+
+    #[test]
+    fn packet_list_auto_follow_and_scroll_behavior() {
+        let ws = AnalyzerWorkspace::new();
+        let mut app = crate::app::MashGuiApp::new(ws);
+
+        // 1. Verify auto-follow is active by default
+        assert!(app.capture_autoscroll);
+        assert_eq!(app.pending_scroll_to_row, None);
+
+        // 2. Start live streaming and simulate packet arrival
+        app.start_live_capture();
+        assert!(app.is_streaming_capture);
+
+        let initial_count = app.ws.frames.len();
+        let frame = mash_capture::capture_single_interface_frame("eth0", 99);
+        app.ws.push_frame(frame);
+        let new_fno = app.ws.frames.len() as u64;
+        assert_eq!(new_fno, (initial_count + 1) as u64);
+
+        if app.capture_autoscroll {
+            app.ws.select_frame(new_fno);
+        }
+        assert_eq!(app.ws.selected_frame, Some(new_fno));
+
+        // 3. User manually selects earlier packet #2 to inspect details -> pauses auto-follow
+        if app.is_streaming_capture && app.capture_autoscroll {
+            app.capture_autoscroll = false;
+        }
+        app.ws.select_frame(2);
+        assert!(!app.capture_autoscroll);
+        assert_eq!(app.ws.selected_frame, Some(2));
+
+        // 4. Another packet arrives while paused -> selected frame remains user's choice #2
+        let frame2 = mash_capture::capture_single_interface_frame("eth0", 100);
+        app.ws.push_frame(frame2);
+        assert_eq!(app.ws.selected_frame, Some(2));
+
+        // 5. User resumes live auto-follow -> sets pending scroll to bottom
+        app.capture_autoscroll = true;
+        let last_row = app.ws.filtered_indices.len().saturating_sub(1);
+        app.pending_scroll_to_row = Some(last_row);
+        assert_eq!(app.pending_scroll_to_row, Some(last_row));
+
+        // 6. Test Quick Jump to Top
+        app.pending_scroll_to_row = Some(0);
+        app.capture_autoscroll = false;
+        if let Some(&first_idx) = app.ws.filtered_indices.first() {
+            if let Some(pkt) = app.ws.dissected.get(first_idx) {
+                app.ws.select_frame(pkt.summary.number);
+            }
+        }
+        assert_eq!(app.pending_scroll_to_row, Some(0));
+        assert_eq!(app.ws.selected_frame, Some(1));
+
+        app.stop_live_capture();
+        assert!(!app.is_streaming_capture);
+    }
 }

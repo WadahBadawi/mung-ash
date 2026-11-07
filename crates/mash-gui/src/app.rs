@@ -84,6 +84,7 @@ pub struct MashGuiApp {
     pub is_streaming_capture: bool,
     pub capture_continuous: bool,
     pub capture_autoscroll: bool,
+    pub pending_scroll_to_row: Option<usize>,
     pub streaming_seq: u64,
     pub streaming_last_tick: Option<std::time::Instant>,
     pub active_capture_local_ip: [u8; 4],
@@ -149,6 +150,7 @@ impl MashGuiApp {
             is_streaming_capture: false,
             capture_continuous: true,
             capture_autoscroll: true,
+            pending_scroll_to_row: None,
             streaming_seq: 0,
             streaming_last_tick: None,
             active_capture_local_ip: [192, 168, 1, 10],
@@ -427,20 +429,37 @@ impl MashGuiApp {
         }
         ctx.input(|i| {
             if i.key_pressed(Key::ArrowDown) {
+                if self.is_streaming_capture && self.capture_autoscroll {
+                    self.capture_autoscroll = false;
+                }
                 if let Some(fno) = self.ws.select_next_displayed_frame() {
                     self.status_line = format!("Selected Packet #{fno}");
                 }
             } else if i.key_pressed(Key::ArrowUp) {
+                if self.is_streaming_capture && self.capture_autoscroll {
+                    self.capture_autoscroll = false;
+                }
                 if let Some(fno) = self.ws.select_prev_displayed_frame() {
                     self.status_line = format!("Selected Packet #{fno}");
                 }
             } else if i.key_pressed(Key::Home) {
                 if let Some(fno) = self.ws.select_first_displayed_frame() {
+                    self.pending_scroll_to_row = Some(0);
+                    self.capture_autoscroll = false;
                     self.status_line = format!("Jumped to first displayed Packet #{fno}");
                 }
             } else if i.key_pressed(Key::End) {
                 if let Some(fno) = self.ws.select_last_displayed_frame() {
+                    self.pending_scroll_to_row = Some(self.ws.filtered_indices.len().saturating_sub(1));
                     self.status_line = format!("Jumped to last displayed Packet #{fno}");
+                }
+            } else if i.modifiers.ctrl && i.key_pressed(Key::F) {
+                self.capture_autoscroll = !self.capture_autoscroll;
+                if self.capture_autoscroll {
+                    self.pending_scroll_to_row = Some(self.ws.filtered_indices.len().saturating_sub(1));
+                    self.status_line = "Auto-follow live stream: ENABLED".to_string();
+                } else {
+                    self.status_line = "Auto-follow live stream: PAUSED".to_string();
                 }
             } else if i.modifiers.ctrl && i.key_pressed(Key::M) {
                 if let Some(fno) = self.ws.selected_frame {
@@ -593,6 +612,19 @@ impl MashGuiApp {
                     self.run_live_capture();
                 }
                 ui.separator();
+                if ui
+                    .checkbox(
+                        &mut self.capture_autoscroll,
+                        "⬇ Follow Live Stream / Auto-Scroll (Ctrl+F)",
+                    )
+                    .clicked()
+                {
+                    if self.capture_autoscroll {
+                        self.pending_scroll_to_row = Some(self.ws.filtered_indices.len().saturating_sub(1));
+                    }
+                    ui.close_menu();
+                }
+                ui.separator();
                 if ui.button("📡 Capture Options & Hardware Config...").clicked() {
                     ui.close_menu();
                     self.main_view = MainWorkstationView::CaptureWorkstation;
@@ -700,6 +732,20 @@ impl MashGuiApp {
                     crate::theme::colors::ERROR,
                     RichText::new("● STREAMING").monospace().small().strong(),
                 );
+
+                // Auto-Follow Toggle in Toolbar
+                let (follow_txt, follow_col, follow_bg) = if self.capture_autoscroll {
+                    ("⬇ Auto-Follow Live: ON", Color32::WHITE, crate::theme::colors::SUCCESS)
+                } else {
+                    ("⏸ Auto-Follow: PAUSED", crate::theme::colors::ON_SURFACE, crate::theme::colors::SURFACE_CONTAINER_HIGH)
+                };
+                let follow_btn = egui::Button::new(RichText::new(follow_txt).small().strong().color(follow_col)).fill(follow_bg);
+                if ui.add(follow_btn).on_hover_text("Toggle automatic table scrolling to newest live packets (Ctrl+F)").clicked() {
+                    self.capture_autoscroll = !self.capture_autoscroll;
+                    if self.capture_autoscroll {
+                        self.pending_scroll_to_row = Some(self.ws.filtered_indices.len().saturating_sub(1));
+                    }
+                }
             } else {
                 let cap_btn = egui::Button::new(
                     RichText::new("▶ Live Capture")
@@ -714,6 +760,19 @@ impl MashGuiApp {
                 {
                     self.main_view = MainWorkstationView::CaptureWorkstation;
                     self.active_tool = ActiveToolTab::Capture;
+                }
+
+                let follow_label = if self.capture_autoscroll {
+                    "⬇ Auto-Follow: ON"
+                } else {
+                    "⬇ Auto-Follow: OFF"
+                };
+                if ui
+                    .selectable_label(self.capture_autoscroll, follow_label)
+                    .on_hover_text("Enable or disable automatic packet list following during live capture")
+                    .clicked()
+                {
+                    self.capture_autoscroll = !self.capture_autoscroll;
                 }
             }
 
@@ -1002,21 +1061,112 @@ impl MashGuiApp {
                     .monospace()
                     .small(),
             );
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.is_streaming_capture {
+                    if self.capture_autoscroll {
+                        let btn = egui::Button::new(
+                            RichText::new("⬇ Auto-Follow Live: ON")
+                                .small()
+                                .strong()
+                                .color(crate::theme::colors::ON_PRIMARY),
+                        )
+                        .fill(crate::theme::colors::PRIMARY_CONTAINER);
+                        if ui
+                            .add(btn)
+                            .on_hover_text("Live stream auto-scroll is ACTIVE (automatically follows newest packets). Click to pause so you can inspect earlier packets.")
+                            .clicked()
+                        {
+                            self.capture_autoscroll = false;
+                        }
+                    } else {
+                        let btn = egui::Button::new(
+                            RichText::new("▶ Resume Live Auto-Follow")
+                                .small()
+                                .strong()
+                                .color(Color32::WHITE),
+                        )
+                        .fill(crate::theme::colors::SUCCESS);
+                        if ui
+                            .add(btn)
+                            .on_hover_text("Auto-follow is PAUSED. Click to resume auto-scrolling to the latest live packets.")
+                            .clicked()
+                        {
+                            self.capture_autoscroll = true;
+                            self.pending_scroll_to_row = Some(total_rows.saturating_sub(1));
+                        }
+                    }
+                } else {
+                    let label = if self.capture_autoscroll {
+                        "⬇ Auto-Follow: ON"
+                    } else {
+                        "⬇ Auto-Follow: OFF"
+                    };
+                    if ui
+                        .selectable_label(self.capture_autoscroll, label)
+                        .on_hover_text("When enabled, the table automatically scrolls to the newest packet during live capture.")
+                        .clicked()
+                    {
+                        self.capture_autoscroll = !self.capture_autoscroll;
+                    }
+                }
+
+                // Quick Navigation: Go to Bottom / Go to Top
+                if total_rows > 0 {
+                    if ui
+                        .small_button("⬇ Bottom")
+                        .on_hover_text("Scroll to newest packet")
+                        .clicked()
+                    {
+                        self.pending_scroll_to_row = Some(total_rows.saturating_sub(1));
+                        if let Some(&last_idx) = self.ws.filtered_indices.last() {
+                            if let Some(pkt) = self.ws.dissected.get(last_idx) {
+                                self.ws.select_frame(pkt.summary.number);
+                            }
+                        }
+                    }
+                    if ui
+                        .small_button("⬆ Top")
+                        .on_hover_text("Scroll to first packet")
+                        .clicked()
+                    {
+                        self.pending_scroll_to_row = Some(0);
+                        self.capture_autoscroll = false;
+                        if let Some(&first_idx) = self.ws.filtered_indices.first() {
+                            if let Some(pkt) = self.ws.dissected.get(first_idx) {
+                                self.ws.select_frame(pkt.summary.number);
+                            }
+                        }
+                    }
+                }
+            });
         });
         ui.separator();
 
-        TableBuilder::new(ui)
+        let mut table = TableBuilder::new(ui)
             .striped(true)
             .resizable(true)
             .sense(Sense::click())
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .stick_to_bottom(self.capture_autoscroll && (self.is_streaming_capture || total_rows > 0))
             .column(Column::initial(58.0).at_least(42.0)) // No.
             .column(Column::initial(95.0).at_least(72.0)) // Time
             .column(Column::initial(150.0).at_least(95.0)) // Source
             .column(Column::initial(150.0).at_least(95.0)) // Destination
             .column(Column::initial(92.0).at_least(65.0)) // Protocol
             .column(Column::initial(64.0).at_least(48.0)) // Length
-            .column(Column::remainder().at_least(220.0)) // Info
+            .column(Column::remainder().at_least(220.0)); // Info
+
+        if let Some(target_row) = self.pending_scroll_to_row.take() {
+            if total_rows > 0 {
+                let clamped = target_row.min(total_rows.saturating_sub(1));
+                table = table.scroll_to_row(clamped, Some(egui::Align::Center));
+            }
+        } else if self.capture_autoscroll && self.is_streaming_capture && total_rows > 0 {
+            table = table.scroll_to_row(total_rows.saturating_sub(1), Some(egui::Align::Max));
+        }
+
+        table
             .header(22.0, |mut header| {
                 for title in [
                     "No.",
@@ -1135,6 +1285,10 @@ impl MashGuiApp {
             });
 
         if let Some(fno) = clicked_frame {
+            if self.is_streaming_capture && self.capture_autoscroll {
+                // User explicitly clicked an earlier frame to inspect while streaming; pause auto-follow
+                self.capture_autoscroll = false;
+            }
             self.ws.select_frame(fno);
             if let Some(pkt) = self.ws.dissected.get((fno - 1) as usize) {
                 self.status_line = format!(
@@ -1568,6 +1722,17 @@ impl MashGuiApp {
         cap.frames = frames;
         self.ws.load_capture(cap);
         self.rebuild_streams();
+        if self.capture_autoscroll {
+            let total = self.ws.filtered_indices.len();
+            if total > 0 {
+                self.pending_scroll_to_row = Some(total.saturating_sub(1));
+                if let Some(&last_idx) = self.ws.filtered_indices.last() {
+                    if let Some(pkt) = self.ws.dissected.get(last_idx) {
+                        self.ws.select_frame(pkt.summary.number);
+                    }
+                }
+            }
+        }
         self.status_line = format!(
             "Captured {count} packets from interface '{iface_name}'"
         );

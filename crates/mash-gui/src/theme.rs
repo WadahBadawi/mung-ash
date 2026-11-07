@@ -28,6 +28,9 @@ pub mod colors {
     pub const ERROR_CONTAINER: Color32 = Color32::from_rgb(147, 0, 10);          // #93000a
     pub const ON_ERROR: Color32 = Color32::from_rgb(105, 0, 5);                  // #690005
 
+    pub const SUCCESS: Color32 = Color32::from_rgb(16, 185, 129);                // #10b981
+    pub const SUCCESS_CONTAINER: Color32 = Color32::from_rgb(0, 56, 36);          // #003824
+
     // Protocol badge accent colors
     pub const BADGE_HTTP_FG: Color32 = Color32::from_rgb(0, 56, 36);
     pub const BADGE_HTTP_BG: Color32 = Color32::from_rgb(16, 185, 129);
