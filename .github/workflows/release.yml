@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Package Release (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive_ext: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive_ext: zip
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive_ext: tar.gz
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux GUI system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+
+      - name: Build release binaries
+        run: cargo build --release --workspace --target ${{ matrix.target }}
+
+      - name: Package archive (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          STAGE="mung-ash-${{ matrix.target }}"
+          mkdir -p "$STAGE"
+          for bin in mash mash-gui mash-cap mash-info mash-edit mash-merge mash-text2pcap mash-mcp; do
+            cp "target/${{ matrix.target }}/release/$bin" "$STAGE/"
+          done
+          cp README.md install.sh "$STAGE/"
+          tar -czf "${STAGE}.tar.gz" "$STAGE"
+          shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+
+      - name: Package archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $Stage = "mung-ash-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $Stage | Out-Null
+          foreach ($bin in @("mash.exe","mash-gui.exe","mash-cap.exe","mash-info.exe","mash-edit.exe","mash-merge.exe","mash-text2pcap.exe","mash-mcp.exe")) {
+            Copy-Item "target/${{ matrix.target }}/release/$bin" "$Stage/$bin"
+          }
+          Copy-Item README.md, install.ps1 $Stage
+          Compress-Archive -Path "$Stage/*" -DestinationPath "${Stage}.zip" -Force
+          $hash = (Get-FileHash "${Stage}.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  ${Stage}.zip" | Out-File -Encoding ascii "${Stage}.zip.sha256"
+
+      - name: Upload Release Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mung-ash-${{ matrix.target }}
+          path: |
+            mung-ash-${{ matrix.target }}.*

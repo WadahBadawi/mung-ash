@@ -24,3 +24,49 @@
 | `crates/mash-cli` | Complete CLI & 3-pane TUI suite (`mash`, `mash --tui`, `mash-info`, `mash-edit`, `mash-merge`, `mash-text2pcap`) |
 | `crates/mash-gui` | Three-pane synchronized analyzer workspace (`mash-gui`) with virtualized packet list, bidirectional field-to-byte highlighting, coloring rules, and profiles |
 
+---
+
+## Installation
+
+### Windows (PowerShell)
+
+Run the included installer script from the repository root to build all 8 release binaries and install them into `~/.cargo/bin` (on your `PATH`):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+To also create a portable `.zip` release bundle in `dist\`:
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -CreateZip
+```
+
+To uninstall:
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall
+```
+
+### Linux & macOS
+
+```sh
+chmod +x ./install.sh
+./install.sh
+# Optional on Linux: grant packet capture capabilities to mash-cap
+./install.sh --setcap
+```
+
+---
+
+## Installed Binaries (8 Tools)
+
+| Binary | Role | Example Command |
+|---|---|---|
+| `mash` | Primary CLI & 3-pane Terminal UI analyzer | `mash -r capture.pcapng -Y "tcp.port == 443"` or `mash --tui -r capture.pcapng` |
+| `mash-gui` | Desktop 3-pane graphical protocol analyzer | `mash-gui capture.pcapng` |
+| `mash-cap` | Minimal isolated packet capture helper | `mash-cap -i eth0 -f "udp and port 53" -c 100 -w dns.pcapng` |
+| `mash-info` | Capture metadata, timing & SHA-256 inspector | `mash-info capture.pcapng` |
+| `mash-edit` | Packet slicer, deduplicator & HMAC anonymizer | `mash-edit -d --anonymize my-secret-key in.pcapng out.pcapng` |
+| `mash-merge` | Chronological / concatenated multi-file merger | `mash-merge -w merged.pcapng part1.pcapng part2.pcapng` |
+| `mash-text2pcap` | ASCII hex dump to PCAP/PCAPNG converter | `mash-text2pcap -T 54321,80 dump.txt http.pcapng` |
+| `mash-mcp` | Model Context Protocol (MCP) JSON-RPC 2.0 server | `mash-mcp` |
+
