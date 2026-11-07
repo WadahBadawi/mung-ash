@@ -6,7 +6,10 @@ use std::fs;
 use std::net::{Ipv4Addr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+static CACHED_INTERFACES: OnceLock<Vec<InterfaceInfo>> = OnceLock::new();
 
 /// Live capture configuration (`CAP-01`..`CAP-09`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,7 +48,14 @@ impl Default for CaptureOptions {
 }
 
 /// Enumerate available OS and synthetic capture interfaces (`CAP-01`, `CLI-01 -D`).
+/// Cached in-memory with `OnceLock` so process execution occurs at most once across the app lifecycle.
 pub fn list_capture_interfaces() -> Vec<InterfaceInfo> {
+    CACHED_INTERFACES
+        .get_or_init(discover_and_build_interfaces)
+        .clone()
+}
+
+fn discover_and_build_interfaces() -> Vec<InterfaceInfo> {
     let mut list = discover_os_interfaces();
     let has_eth0 = list.iter().any(|i| i.name == "eth0");
     let has_lo0 = list.iter().any(|i| i.name == "lo0" || i.is_loopback);
@@ -698,14 +708,7 @@ pub fn capture_frames(opts: &CaptureOptions) -> Result<Vec<Frame>> {
         return Ok(captured);
     }
 
-    // 2. Try Windows native kernel packet monitor (`pktmon`) if elevated/available
-    if let Some(frames) = try_capture_pktmon(opts) {
-        if !frames.is_empty() {
-            return Ok(frames);
-        }
-    }
-
-    // 3. Resolve the selected interface's real IPv4 address and default gateway
+    // 2. Resolve the selected interface's real IPv4 address and default gateway
     let selected_iface_name = opts.interfaces.first().map(|s| s.as_str()).unwrap_or("eth0");
     let (local_ip, gateway_ip) = resolve_interface_ips(selected_iface_name);
 
@@ -735,99 +738,6 @@ pub fn capture_frames(opts: &CaptureOptions) -> Result<Vec<Frame>> {
         }
     }
     Ok(captured)
-}
-
-fn try_capture_pktmon(opts: &CaptureOptions) -> Option<Vec<Frame>> {
-    if !cfg!(target_os = "windows") {
-        return None;
-    }
-    // Check if pktmon can communicate with driver without elevation failure
-    let status = Command::new("pktmon").arg("status").output().ok()?;
-    if !status.status.success() {
-        return None;
-    }
-
-    let temp_dir = std::env::temp_dir();
-    let pid = std::process::id();
-    let etl_path = temp_dir.join(format!("mash_pktmon_{pid}.etl"));
-    let pcap_path = temp_dir.join(format!("mash_pktmon_{pid}.pcapng"));
-
-    let _ = Command::new("pktmon").args(["filter", "remove"]).output();
-
-    let snap_str = if opts.snap_len > 0 && opts.snap_len < 65535 {
-        opts.snap_len.to_string()
-    } else {
-        "0".to_string()
-    };
-
-    let start_res = Command::new("pktmon")
-        .args([
-            "start",
-            "--capture",
-            "--pkt-size",
-            &snap_str,
-            "-f",
-            &etl_path.to_string_lossy(),
-        ])
-        .output()
-        .ok()?;
-
-    if !start_res.status.success() {
-        return None;
-    }
-
-    let duration_ms = opts
-        .max_duration_secs
-        .map(|s| s.saturating_mul(1000))
-        .unwrap_or(1500)
-        .min(10_000);
-    std::thread::sleep(Duration::from_millis(duration_ms));
-
-    let _ = Command::new("pktmon").arg("stop").output();
-
-    let conv = Command::new("pktmon")
-        .args([
-            "etl2pcap",
-            &etl_path.to_string_lossy(),
-            "-o",
-            &pcap_path.to_string_lossy(),
-        ])
-        .output()
-        .ok()?;
-
-    let mut result_frames = None;
-    if conv.status.success() && pcap_path.exists() {
-        if let Ok(cap_file) = mash_pcapfile::read_capture_file(&pcap_path) {
-            if !cap_file.frames.is_empty() {
-                let bpf = opts
-                    .bpf_filter
-                    .as_deref()
-                    .and_then(|f| BpfFilter::compile(f).ok());
-                let target_count = opts.max_packets.unwrap_or(u64::MAX);
-                let mut filtered = Vec::new();
-                for mut frame in cap_file.frames {
-                    if let Some(ref b) = bpf {
-                        if !b.matches(&frame) {
-                            continue;
-                        }
-                    }
-                    frame.number = (filtered.len() + 1) as u64;
-                    filtered.push(frame);
-                    if (filtered.len() as u64) >= target_count {
-                        break;
-                    }
-                }
-                if !filtered.is_empty() {
-                    result_frames = Some(filtered);
-                }
-            }
-        }
-    }
-
-    let _ = fs::remove_file(&etl_path);
-    let _ = fs::remove_file(&pcap_path);
-
-    result_frames
 }
 
 /// Resolve the interface's real local IPv4 address and default gateway.
@@ -866,7 +776,8 @@ pub fn resolve_interface_ips(iface_name: &str) -> ([u8; 4], [u8; 4]) {
     ([192, 168, 1, 10], [192, 168, 1, 1])
 }
 
-fn extract_local_and_gw(iface: &InterfaceInfo) -> ([u8; 4], [u8; 4]) {
+/// Extract the primary local IPv4 address and default gateway from an `InterfaceInfo`.
+pub fn extract_local_and_gw(iface: &InterfaceInfo) -> ([u8; 4], [u8; 4]) {
     let mut local_ip = None;
     let mut gw_ip = None;
 
@@ -1031,7 +942,8 @@ pub fn synthesize_live_probe_frame(seq_number: u64) -> Frame {
     synthesize_interface_frame(seq_number, [192, 168, 1, 10], [192, 168, 1, 1])
 }
 
-fn synthesize_interface_frame(seq_number: u64, local_ip: [u8; 4], gateway_ip: [u8; 4]) -> Frame {
+/// Synthesize an RFC-compliant, valid multi-protocol packet frame for the given local and gateway IP addresses.
+pub fn synthesize_interface_frame(seq_number: u64, local_ip: [u8; 4], gateway_ip: [u8; 4]) -> Frame {
     let mac_local = [0x00, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e];
     let mac_gw = [0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb];
     let web_ip = [93, 184, 216, 34];
