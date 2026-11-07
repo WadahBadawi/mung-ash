@@ -604,7 +604,7 @@ impl MashGuiApp {
             });
 
             ui.menu_button("AI & MCP", |ui| {
-                if ui.button("🤖 AI Security Analyst & NL Filter (mash-ai)...").clicked() {
+                if ui.button("✦ AI Security Analyst & NL Filter (mash-ai)...").clicked() {
                     ui.close_menu();
                     self.open_tool(ActiveToolTab::AiAnalyst);
                 }
@@ -619,14 +619,14 @@ impl MashGuiApp {
     fn render_toolbar(&mut self, ui: &mut Ui) {
         ui.horizontal_wrapped(|ui| {
             let cap_btn = egui::Button::new(
-                RichText::new("▶ Capture (mash-cap)")
+                RichText::new("▶ Capture")
                     .strong()
                     .color(Color32::from_rgb(220, 255, 220)),
             )
             .fill(Color32::from_rgb(25, 110, 55));
             if ui
                 .add(cap_btn)
-                .on_hover_text("Open Live Capture & BPF Filter dialog")
+                .on_hover_text("Open Live Capture & BPF Filter dialog (mash-cap)")
                 .clicked()
             {
                 self.open_tool(ActiveToolTab::Capture);
@@ -654,23 +654,23 @@ impl MashGuiApp {
             for (tab, label, tip) in [
                 (
                     ActiveToolTab::FileInfo,
-                    "🔍 File Info (mash-info)",
-                    "Inspect SHA-256, timing, and capture metadata",
+                    "🔍 File Info",
+                    "Inspect SHA-256, timing, and capture metadata (mash-info)",
                 ),
                 (
                     ActiveToolTab::EditAnonymize,
-                    "✂ Edit / Scrub (mash-edit)",
-                    "Deduplicate, slice, time-shift, or HMAC-anonymize IPs & MACs",
+                    "✂ Edit & Scrub",
+                    "Deduplicate, slice, time-shift, or HMAC-anonymize IPs & MACs (mash-edit)",
                 ),
                 (
                     ActiveToolTab::MergeFiles,
-                    "🔀 Merge (mash-merge)",
-                    "Merge multiple capture files chronologically",
+                    "🔀 Merge",
+                    "Merge multiple capture files chronologically (mash-merge)",
                 ),
                 (
                     ActiveToolTab::Text2Pcap,
-                    "📝 Hex2Pcap (mash-text2pcap)",
-                    "Convert ASCII hex dumps into dissected packets",
+                    "📝 Hex2Pcap",
+                    "Convert ASCII hex dumps into dissected packets (mash-text2pcap)",
                 ),
                 (
                     ActiveToolTab::FollowStream,
@@ -684,13 +684,13 @@ impl MashGuiApp {
                 ),
                 (
                     ActiveToolTab::AiAnalyst,
-                    "🤖 AI Analyst (mash-ai)",
-                    "AI Packet Explainer, Anomaly Detector & NL Filter",
+                    "✦ AI Analyst",
+                    "AI Packet Explainer, Anomaly Detector & NL Filter (mash-ai)",
                 ),
                 (
                     ActiveToolTab::McpInspector,
-                    "🔌 MCP Console (mash-mcp)",
-                    "Test Model Context Protocol JSON-RPC 2.0 tools",
+                    "🔌 MCP Console",
+                    "Test Model Context Protocol JSON-RPC 2.0 tools (mash-mcp)",
                 ),
             ] {
                 let is_active = self.open_tool_window && self.active_tool == tab;
@@ -725,7 +725,7 @@ impl MashGuiApp {
                     } else {
                         Color32::from_rgb(245, 245, 250)
                     },
-                    "ALL",
+                    "",
                     Color32::from_rgb(140, 150, 165),
                 ),
                 FilterBarStatus::Valid => (
@@ -749,7 +749,7 @@ impl MashGuiApp {
             };
 
             let mut expr = self.ws.filter_input.clone();
-            let input_w = (ui.available_width() - 470.0).max(180.0);
+            let input_w = (ui.available_width() - 540.0).max(150.0);
             let edit = TextEdit::singleline(&mut expr)
                 .hint_text("Display filter... e.g. http || dns || tcp.port == 443 || bgp || mqtt")
                 .font(FontId::monospace(13.0))
@@ -760,7 +760,9 @@ impl MashGuiApp {
                 self.ws.set_display_filter(&expr);
             }
 
-            ui.colored_label(badge_color, RichText::new(badge_text).small().strong());
+            if !badge_text.is_empty() {
+                ui.colored_label(badge_color, RichText::new(badge_text).small().strong());
+            }
 
             if ui
                 .button("✖ Clear")
@@ -957,7 +959,7 @@ impl MashGuiApp {
                             context_action = Some((fno, "follow"));
                             ui.close_menu();
                         }
-                        if ui.button("🤖 Explain Packet with AI").clicked() {
+                        if ui.button("✦ Explain Packet with AI").clicked() {
                             context_action = Some((fno, "ai"));
                             ui.close_menu();
                         }
@@ -1042,12 +1044,15 @@ impl MashGuiApp {
         ui.horizontal(|ui| {
             ui.add_space((depth as f32) * 16.0);
             if has_children {
-                let icon = if is_expanded { "▼" } else { "▶" };
-                if ui.small_button(icon).clicked() {
+                let icon = if is_expanded { "[-]" } else { "[+]" };
+                if ui
+                    .small_button(RichText::new(icon).monospace())
+                    .clicked()
+                {
                     self.ws.toggle_node_expanded(node_id, &node.abbrev);
                 }
             } else {
-                ui.add_space(22.0);
+                ui.add_space(28.0);
             }
 
             let label_color = if is_selected {
@@ -1077,7 +1082,7 @@ impl MashGuiApp {
             let resp = ui.add(egui::Label::new(text).sense(Sense::click()));
             if resp.clicked() {
                 self.ws.select_field_node(node_id);
-                if has_children && depth > 0 {
+                if has_children {
                     self.ws.toggle_node_expanded(node_id, &node.abbrev);
                 }
                 self.status_line = format!(
@@ -1296,7 +1301,7 @@ impl MashGuiApp {
                 (ActiveToolTab::Text2Pcap, "📝 Hex2Pcap"),
                 (ActiveToolTab::FollowStream, "🌊 Follow Stream"),
                 (ActiveToolTab::Statistics, "📊 Statistics"),
-                (ActiveToolTab::AiAnalyst, "🤖 AI Analyst"),
+                (ActiveToolTab::AiAnalyst, "✦ AI Analyst"),
                 (ActiveToolTab::McpInspector, "🔌 MCP Console"),
             ] {
                 if ui.selectable_label(self.active_tool == tab, label).clicked() {
@@ -1337,7 +1342,7 @@ impl MashGuiApp {
                                 self.open_tool_window = false;
                             }
                             if ui
-                                .small_button("🗗 Float")
+                                .small_button("↗ Float")
                                 .on_hover_text("Detach into a floating window")
                                 .clicked()
                             {
@@ -1359,7 +1364,7 @@ impl MashGuiApp {
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         if ui
-                            .small_button("📌 Dock to Right Side Panel")
+                            .small_button("↙ Dock to Right Side Panel")
                             .clicked()
                         {
                             dock_requested = true;
@@ -1809,7 +1814,7 @@ impl MashGuiApp {
             }
         });
         ui.horizontal_wrapped(|ui| {
-            if ui.button("🤖 Explain Selected Packet").clicked() {
+            if ui.button("✦ Explain Selected Packet").clicked() {
                 if let Some(fno) = self.ws.selected_frame {
                     if let Some(pkt) = self.ws.dissected.get((fno - 1) as usize) {
                         if let Ok(text) = self.ws.ai.explain_packet(pkt) {

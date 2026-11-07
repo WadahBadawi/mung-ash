@@ -175,9 +175,8 @@ impl AnalyzerWorkspace {
         let engine = build_default_engine();
         let profile = WorkspaceProfile::default();
         let default_expanded: HashSet<String> = [
-            "eth", "vlan", "arp", "ip", "ipv6", "icmp", "icmpv6", "tcp", "udp", "dns", "dhcp",
-            "dhcpv6", "http", "tls", "quic", "ntp", "bgp", "ospf", "mqtt", "modbus", "smb2",
-            "grpc", "vxlan", "gre", "mpls",
+            "arp", "icmp", "icmpv6", "dns", "dhcp", "dhcpv6", "http", "tls", "quic", "ntp", "bgp",
+            "ospf", "mqtt", "modbus", "smb2", "grpc",
         ]
         .into_iter()
         .map(String::from)
@@ -671,8 +670,28 @@ mod tests {
         assert_eq!(selected_abbrev, Some("tcp.flags"));
 
         // Verify deterministic tree node expansion toggle
-        assert!(app.ws.is_node_expanded(NodeId(0), "eth"));
-        app.ws.toggle_node_expanded(NodeId(0), "eth");
+        assert!(app.ws.is_node_expanded(NodeId(0), "dns"));
         assert!(!app.ws.is_node_expanded(NodeId(0), "eth"));
+        app.ws.toggle_node_expanded(NodeId(0), "eth");
+        assert!(app.ws.is_node_expanded(NodeId(0), "eth"));
+
+        // Verify live interface capture produces 25 valid, non-malformed packets
+        let live_frames = mash_capture::capture_frames(&mash_capture::CaptureOptions {
+            interfaces: vec!["eth0".to_string()],
+            max_packets: Some(25),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(live_frames.len(), 25);
+        let mut cap = CaptureFile::new(CaptureFormat::PcapNg);
+        cap.frames = live_frames;
+        app.ws.load_capture(cap);
+        for pkt in &app.ws.dissected {
+            assert!(
+                !pkt.summary.info.contains("Malformed Packet"),
+                "Unexpected malformed packet in live capture: {:?}",
+                pkt.summary
+            );
+        }
     }
 }
