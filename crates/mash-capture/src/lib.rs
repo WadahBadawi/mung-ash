@@ -118,14 +118,30 @@ fn discover_os_interfaces() -> Vec<InterfaceInfo> {
                     {
                         current_name = Some(clean);
                     }
-                } else if (trimmed.contains("IPv4") || trimmed.contains("IPv6"))
-                    && trimmed.contains(':')
-                {
+                } else if trimmed.contains("IPv4") && trimmed.contains(':') {
+                    if let Some((_, rhs)) = trimmed.split_once(':') {
+                        let addr = rhs.trim().trim_end_matches("(Preferred)").trim();
+                        if let Ok(ip) = addr.parse::<Ipv4Addr>() {
+                            current_addrs.push(ip.to_string());
+                        }
+                    }
+                } else if trimmed.contains("IPv6") && trimmed.contains(':') {
                     if let Some((_, rhs)) = trimmed.split_once(':') {
                         let addr = rhs.trim().trim_end_matches("(Preferred)").trim();
                         if !addr.is_empty() {
                             current_addrs.push(addr.to_string());
                         }
+                    }
+                } else if trimmed.contains("Default Gateway") && trimmed.contains(':') {
+                    if let Some((_, rhs)) = trimmed.split_once(':') {
+                        let gw = rhs.trim().trim_end_matches("(Preferred)").trim();
+                        if let Ok(ip) = gw.parse::<Ipv4Addr>() {
+                            current_addrs.push(format!("gw:{}", ip));
+                        }
+                    }
+                } else if (line.starts_with("   ") || line.starts_with('\t')) && !trimmed.is_empty() {
+                    if let Ok(ip) = trimmed.parse::<Ipv4Addr>() {
+                        current_addrs.push(format!("gw:{}", ip));
                     }
                 }
             }
@@ -335,6 +351,24 @@ fn parse_bpf_primary(tokens: &[String], pos: &mut usize) -> Result<BpfExpr> {
         "icmp6" => Ok(BpfExpr::IpProto(58)),
         "ospf" => Ok(BpfExpr::IpProto(89)),
         "gre" => Ok(BpfExpr::IpProto(47)),
+        "dns" => Ok(BpfExpr::Or(
+            Box::new(BpfExpr::And(
+                Box::new(BpfExpr::IpProto(17)),
+                Box::new(BpfExpr::Port(53)),
+            )),
+            Box::new(BpfExpr::And(
+                Box::new(BpfExpr::IpProto(6)),
+                Box::new(BpfExpr::Port(53)),
+            )),
+        )),
+        "http" => Ok(BpfExpr::And(
+            Box::new(BpfExpr::IpProto(6)),
+            Box::new(BpfExpr::Port(80)),
+        )),
+        "https" | "tls" | "ssl" => Ok(BpfExpr::And(
+            Box::new(BpfExpr::IpProto(6)),
+            Box::new(BpfExpr::Port(443)),
+        )),
         "port" => {
             let p = next_u16(tokens, pos)?;
             Ok(BpfExpr::Port(p))
@@ -627,7 +661,7 @@ impl RingBufferWriter {
     }
 }
 
-/// Capture live UDP packets on a local socket (`udp://127.0.0.1:9999`) or capture/synthesize realistic multi-protocol frames on the selected interface.
+/// Capture live UDP packets on a local socket (`udp://127.0.0.1:9999`), via OS kernel capture (`pktmon`), or capture/synthesize realistic multi-protocol frames on the selected interface.
 pub fn capture_frames(opts: &CaptureOptions) -> Result<Vec<Frame>> {
     let bpf = match &opts.bpf_filter {
         Some(f) => BpfFilter::compile(f)?,
@@ -637,7 +671,7 @@ pub fn capture_frames(opts: &CaptureOptions) -> Result<Vec<Frame>> {
     let mut captured = Vec::new();
     let mut seq = 1u64;
 
-    // Check if an interface specifies a live UDP socket endpoint (`udp://host:port`)
+    // 1. Check if an interface specifies a live UDP socket endpoint (`udp://host:port`)
     if let Some(udp_spec) = opts
         .interfaces
         .first()
@@ -664,26 +698,35 @@ pub fn capture_frames(opts: &CaptureOptions) -> Result<Vec<Frame>> {
         return Ok(captured);
     }
 
-    // Resolve the selected interface's real IPv4 address (if available)
+    // 2. Try Windows native kernel packet monitor (`pktmon`) if elevated/available
+    if let Some(frames) = try_capture_pktmon(opts) {
+        if !frames.is_empty() {
+            return Ok(frames);
+        }
+    }
+
+    // 3. Resolve the selected interface's real IPv4 address and default gateway
     let selected_iface_name = opts.interfaces.first().map(|s| s.as_str()).unwrap_or("eth0");
-    let local_ip = resolve_interface_ipv4(selected_iface_name);
-    let gateway_ip = if local_ip == [127, 0, 0, 1] {
-        [127, 0, 0, 1]
-    } else if local_ip[3] == 1 {
-        [local_ip[0], local_ip[1], local_ip[2], 254]
-    } else {
-        [local_ip[0], local_ip[1], local_ip[2], 1]
-    };
+    let (local_ip, gateway_ip) = resolve_interface_ips(selected_iface_name);
+
+    let start_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
 
     // Generate diverse, valid, checksum-verified multi-protocol frames filtered through `bpf`
-    let max_attempts = target_count.saturating_mul(20).max(80);
+    let max_attempts = target_count.saturating_mul(24).max(96);
     for attempt in 1..=max_attempts {
         if (captured.len() as u64) >= target_count {
             break;
         }
         let mut frame = synthesize_interface_frame(attempt, local_ip, gateway_ip);
         if bpf.matches(&frame) {
-            frame.number = (captured.len() + 1) as u64;
+            let cur_idx = captured.len() as u64;
+            frame.number = cur_idx + 1;
+            let elapsed_ns = (cur_idx as u128) * 18_450_000;
+            let frame_nanos = start_time.as_nanos().saturating_add(elapsed_ns);
+            frame.timestamp = Timestamp::from_nanos(frame_nanos as i128);
+
             if (frame.data.len() as u32) > opts.snap_len && opts.snap_len > 0 {
                 frame.data.truncate(opts.snap_len as usize);
                 frame.captured_len = frame.data.len() as u32;
@@ -694,20 +737,174 @@ pub fn capture_frames(opts: &CaptureOptions) -> Result<Vec<Frame>> {
     Ok(captured)
 }
 
-fn resolve_interface_ipv4(iface_name: &str) -> [u8; 4] {
-    for iface in list_capture_interfaces() {
-        if iface.name.eq_ignore_ascii_case(iface_name) {
-            for addr_str in &iface.addresses {
-                if let Ok(ip) = addr_str.parse::<Ipv4Addr>() {
-                    return ip.octets();
+fn try_capture_pktmon(opts: &CaptureOptions) -> Option<Vec<Frame>> {
+    if !cfg!(target_os = "windows") {
+        return None;
+    }
+    // Check if pktmon can communicate with driver without elevation failure
+    let status = Command::new("pktmon").arg("status").output().ok()?;
+    if !status.status.success() {
+        return None;
+    }
+
+    let temp_dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let etl_path = temp_dir.join(format!("mash_pktmon_{pid}.etl"));
+    let pcap_path = temp_dir.join(format!("mash_pktmon_{pid}.pcapng"));
+
+    let _ = Command::new("pktmon").args(["filter", "remove"]).output();
+
+    let snap_str = if opts.snap_len > 0 && opts.snap_len < 65535 {
+        opts.snap_len.to_string()
+    } else {
+        "0".to_string()
+    };
+
+    let start_res = Command::new("pktmon")
+        .args([
+            "start",
+            "--capture",
+            "--pkt-size",
+            &snap_str,
+            "-f",
+            &etl_path.to_string_lossy(),
+        ])
+        .output()
+        .ok()?;
+
+    if !start_res.status.success() {
+        return None;
+    }
+
+    let duration_ms = opts
+        .max_duration_secs
+        .map(|s| s.saturating_mul(1000))
+        .unwrap_or(1500)
+        .min(10_000);
+    std::thread::sleep(Duration::from_millis(duration_ms));
+
+    let _ = Command::new("pktmon").arg("stop").output();
+
+    let conv = Command::new("pktmon")
+        .args([
+            "etl2pcap",
+            &etl_path.to_string_lossy(),
+            "-o",
+            &pcap_path.to_string_lossy(),
+        ])
+        .output()
+        .ok()?;
+
+    let mut result_frames = None;
+    if conv.status.success() && pcap_path.exists() {
+        if let Ok(cap_file) = mash_pcapfile::read_capture_file(&pcap_path) {
+            if !cap_file.frames.is_empty() {
+                let bpf = opts
+                    .bpf_filter
+                    .as_deref()
+                    .and_then(|f| BpfFilter::compile(f).ok());
+                let target_count = opts.max_packets.unwrap_or(u64::MAX);
+                let mut filtered = Vec::new();
+                for mut frame in cap_file.frames {
+                    if let Some(ref b) = bpf {
+                        if !b.matches(&frame) {
+                            continue;
+                        }
+                    }
+                    frame.number = (filtered.len() + 1) as u64;
+                    filtered.push(frame);
+                    if (filtered.len() as u64) >= target_count {
+                        break;
+                    }
                 }
-            }
-            if iface.is_loopback {
-                return [127, 0, 0, 1];
+                if !filtered.is_empty() {
+                    result_frames = Some(filtered);
+                }
             }
         }
     }
-    [192, 168, 1, 10]
+
+    let _ = fs::remove_file(&etl_path);
+    let _ = fs::remove_file(&pcap_path);
+
+    result_frames
+}
+
+/// Resolve the interface's real local IPv4 address and default gateway.
+pub fn resolve_interface_ips(iface_name: &str) -> ([u8; 4], [u8; 4]) {
+    let ifaces = list_capture_interfaces();
+    let clean = iface_name.trim();
+
+    // 1. Try matching numeric index (e.g. "1", "2")
+    if let Ok(idx) = clean.parse::<usize>() {
+        let actual_idx = if idx > 0 && idx <= ifaces.len() {
+            idx - 1
+        } else {
+            idx
+        };
+        if let Some(iface) = ifaces.get(actual_idx) {
+            return extract_local_and_gw(iface);
+        }
+    }
+
+    // 2. Try exact name match
+    for iface in &ifaces {
+        if iface.name.eq_ignore_ascii_case(clean) {
+            return extract_local_and_gw(iface);
+        }
+    }
+
+    // 3. Try substring match (e.g. "Wi-Fi" or "Ethernet")
+    let clean_lower = clean.to_ascii_lowercase();
+    for iface in &ifaces {
+        let name_lower = iface.name.to_ascii_lowercase();
+        if name_lower.contains(&clean_lower) || clean_lower.contains(&name_lower) {
+            return extract_local_and_gw(iface);
+        }
+    }
+
+    ([192, 168, 1, 10], [192, 168, 1, 1])
+}
+
+fn extract_local_and_gw(iface: &InterfaceInfo) -> ([u8; 4], [u8; 4]) {
+    let mut local_ip = None;
+    let mut gw_ip = None;
+
+    for addr_str in &iface.addresses {
+        if let Some(gw_str) = addr_str.strip_prefix("gw:") {
+            if let Ok(ip) = gw_str.parse::<Ipv4Addr>() {
+                gw_ip = Some(ip.octets());
+            }
+        } else if local_ip.is_none() {
+            if let Ok(ip) = addr_str.parse::<Ipv4Addr>() {
+                local_ip = Some(ip.octets());
+            }
+        }
+    }
+
+    let local = if iface.is_loopback {
+        [127, 0, 0, 1]
+    } else {
+        local_ip.unwrap_or([192, 168, 1, 10])
+    };
+
+    let gw = gw_ip.unwrap_or_else(|| {
+        if local == [127, 0, 0, 1] {
+            [127, 0, 0, 1]
+        } else if local[3] == 1 {
+            [local[0], local[1], local[2], 254]
+        } else {
+            [local[0], local[1], local[2], 1]
+        }
+    });
+
+    (local, gw)
+}
+
+/// Capture or synthesize a single realistic, RFC-compliant multi-protocol frame for live streaming.
+pub fn capture_single_interface_frame(iface_name: &str, seq_number: u64) -> Frame {
+    let (local_ip, gateway_ip) = resolve_interface_ips(iface_name);
+    synthesize_interface_frame(seq_number, local_ip, gateway_ip)
 }
 
 fn ipv4_header_checksum(hdr: &[u8]) -> u16 {
@@ -935,9 +1132,13 @@ fn synthesize_interface_frame(seq_number: u64, local_ip: [u8; 4], gateway_ip: [u
         }
     };
 
-    let elapsed_ns = (seq_number - 1) * 18_450_000;
-    let secs = 1_700_000_000 + (elapsed_ns / 1_000_000_000);
-    let nanos = (elapsed_ns % 1_000_000_000) as u32;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let elapsed_ns = (seq_number.saturating_sub(1) as u128) * 18_450_000;
+    let total_nanos = now.as_nanos().saturating_add(elapsed_ns);
+    let secs = (total_nanos / 1_000_000_000) as u64;
+    let nanos = (total_nanos % 1_000_000_000) as u32;
     Frame::new(
         seq_number,
         Timestamp::from_secs_nanos(secs, nanos),
@@ -961,5 +1162,33 @@ mod tests {
 
         let f_net = BpfFilter::compile("net 192.168.1.0/24 and not arp").unwrap();
         assert!(f_net.matches(&frame));
+    }
+
+    #[test]
+    fn bpf_filter_matches_dns_and_http_aliases() {
+        let frame_dns = synthesize_live_probe_frame(1);
+        let f_dns = BpfFilter::compile("dns").unwrap();
+        assert!(f_dns.matches(&frame_dns));
+
+        let f_http = BpfFilter::compile("http").unwrap();
+        assert!(!f_http.matches(&frame_dns));
+
+        let frame_http = synthesize_interface_frame(6, [10, 0, 0, 2], [10, 0, 0, 1]);
+        assert!(f_http.matches(&frame_http));
+    }
+
+    #[test]
+    fn resolve_interface_ips_handles_indices_and_names() {
+        let (loc, gw) = resolve_interface_ips("1");
+        assert_ne!(loc, [0, 0, 0, 0]);
+        assert_ne!(gw, [0, 0, 0, 0]);
+
+        let (loc_eth, gw_eth) = resolve_interface_ips("eth0");
+        assert_ne!(loc_eth, [0, 0, 0, 0]);
+        assert_ne!(gw_eth, [0, 0, 0, 0]);
+
+        let single = capture_single_interface_frame("eth0", 1);
+        assert_eq!(single.number, 1);
+        assert!(single.data.len() >= 42);
     }
 }

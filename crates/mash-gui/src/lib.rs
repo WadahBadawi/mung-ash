@@ -235,6 +235,40 @@ impl AnalyzerWorkspace {
         self.redissect_all();
     }
 
+    /// Push a single incoming live frame into the workspace without full re-dissection overhead.
+    pub fn push_frame(&mut self, mut frame: Frame) {
+        frame.number = (self.frames.len() + 1) as u64;
+        let mut resolver = NameResolver::new(self.profile.resolution);
+        let mut conv = ConversationTracker::new();
+        let ref_ts = self.frames.first().map(|f| f.timestamp);
+        let prev_ts = self.frames.last().map(|f| f.timestamp);
+        let pkt = self
+            .engine
+            .dissect_frame(&frame, ref_ts, prev_ts, &mut resolver, &mut conv);
+        let idx = self.frames.len();
+        self.frames.push(frame);
+        self.dissected.push(pkt);
+
+        let matches_filter = match &self.filter_status {
+            FilterBarStatus::Empty => true,
+            FilterBarStatus::Valid => {
+                if let Ok(cf) = CompiledFilter::compile(self.filter_input.trim(), Some(&self.engine.registry)) {
+                    cf.matches(&self.dissected[idx])
+                } else {
+                    true
+                }
+            }
+            FilterBarStatus::Invalid(_) => false,
+        };
+
+        if matches_filter {
+            self.filtered_indices.push(idx);
+            if self.selected_frame.is_none() {
+                self.selected_frame = Some(self.dissected[idx].summary.number);
+            }
+        }
+    }
+
     pub fn redissect_all(&mut self) {
         let mut resolver = NameResolver::new(self.profile.resolution);
         let mut conv = ConversationTracker::new();
@@ -729,5 +763,52 @@ mod tests {
 
         let (_err_fg, err_bg) = crate::theme::protocol_badge_colors("Malformed Packet: DNS");
         assert_eq!(err_bg, crate::theme::colors::ERROR_CONTAINER);
+    }
+
+    #[test]
+    fn live_capture_streaming_and_interface_resolution() {
+        let ws = AnalyzerWorkspace::new();
+        let mut app = crate::app::MashGuiApp::new(ws);
+
+        // Start streaming capture
+        app.start_live_capture();
+        assert!(app.is_streaming_capture);
+
+        // Stream 15 single frames dynamically into workspace
+        for i in 1..=15 {
+            let frame = mash_capture::capture_single_interface_frame("eth0", i);
+            app.ws.push_frame(frame);
+        }
+        assert_eq!(app.ws.frames.len(), 14 + 15);
+
+        // Verify none of the streamed packets are malformed
+        for pkt in &app.ws.dissected {
+            assert!(
+                !pkt.summary.info.contains("Malformed Packet"),
+                "Streamed packet was malformed: {:?}",
+                pkt.summary
+            );
+        }
+
+        // Stop streaming capture
+        app.stop_live_capture();
+        assert!(!app.is_streaming_capture);
+
+        // Test BPF filter on live capture (e.g. dns)
+        let dns_frames = mash_capture::capture_frames(&mash_capture::CaptureOptions {
+            interfaces: vec!["eth0".to_string()],
+            bpf_filter: Some("dns".to_string()),
+            max_packets: Some(5),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(dns_frames.len(), 5);
+        for f in &dns_frames {
+            let mut res = NameResolver::new(Default::default());
+            let mut conv = ConversationTracker::new();
+            let pkt = app.ws.engine.dissect_frame(f, None, None, &mut res, &mut conv);
+            assert_eq!(pkt.summary.protocol, "DNS");
+            assert!(!pkt.summary.info.contains("Malformed"));
+        }
     }
 }

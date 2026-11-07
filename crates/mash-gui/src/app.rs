@@ -4,7 +4,10 @@ use eframe::egui::{
     Ui,
 };
 use egui_extras::{Column, TableBuilder};
-use mash_capture::{capture_frames, list_capture_interfaces, BpfFilter, CaptureOptions};
+use mash_capture::{
+    capture_frames, capture_single_interface_frame, list_capture_interfaces, BpfFilter,
+    CaptureOptions,
+};
 use mash_cli::{apply_capture_edits, export_ek_lines, export_pdml, export_psml, EditOptions};
 use mash_core::{Frame, InterfaceInfo, LinkType, NodeId, Timestamp};
 use mash_mcp::{JsonRpcRequest, McpServer};
@@ -79,6 +82,11 @@ pub struct MashGuiApp {
     pub capture_count: u64,
     pub capture_snaplen: u32,
     pub capture_promisc: bool,
+    pub is_streaming_capture: bool,
+    pub capture_continuous: bool,
+    pub capture_autoscroll: bool,
+    pub streaming_seq: u64,
+    pub streaming_last_tick: Option<std::time::Instant>,
 
     // 2. Edit & Anonymizer (`mash-edit`) state
     pub edit_dedup_enabled: bool,
@@ -137,6 +145,11 @@ impl MashGuiApp {
             capture_count: 25,
             capture_snaplen: 262_144,
             capture_promisc: true,
+            is_streaming_capture: false,
+            capture_continuous: true,
+            capture_autoscroll: true,
+            streaming_seq: 0,
+            streaming_last_tick: None,
             edit_dedup_enabled: false,
             edit_dedup_window: 5,
             edit_snaplen_enabled: false,
@@ -438,6 +451,12 @@ impl MashGuiApp {
                 if let Some(fno) = self.ws.selected_frame {
                     self.ws.toggle_time_reference(fno);
                 }
+            } else if i.modifiers.ctrl && i.key_pressed(Key::E) {
+                if self.is_streaming_capture {
+                    self.stop_live_capture();
+                } else {
+                    self.start_live_capture();
+                }
             }
         });
     }
@@ -555,13 +574,26 @@ impl MashGuiApp {
             });
 
             ui.menu_button("Capture", |ui| {
-                if ui.button("▶ Capture Options & Start (mash-cap)...").clicked() {
-                    ui.close_menu();
-                    self.open_tool(ActiveToolTab::Capture);
+                if self.is_streaming_capture {
+                    if ui.button("⏹ Stop Live Streaming Capture (Ctrl+E)").clicked() {
+                        ui.close_menu();
+                        self.stop_live_capture();
+                    }
+                } else {
+                    if ui.button("▶ Start Live Streaming Capture (Ctrl+E)").clicked() {
+                        ui.close_menu();
+                        self.start_live_capture();
+                    }
                 }
-                if ui.button("⚡ Quick Capture on Primary Interface").clicked() {
+                if ui.button("⚡ Quick Batch Capture (-c Limit)").clicked() {
                     ui.close_menu();
                     self.run_live_capture();
+                }
+                ui.separator();
+                if ui.button("📡 Capture Options & Hardware Config...").clicked() {
+                    ui.close_menu();
+                    self.main_view = MainWorkstationView::CaptureWorkstation;
+                    self.open_tool(ActiveToolTab::Capture);
                 }
             });
 
@@ -647,19 +679,39 @@ impl MashGuiApp {
             ui.separator();
 
             // Primary action button: Live Capture
-            let cap_btn = egui::Button::new(
-                RichText::new("▶ Live Capture")
-                    .strong()
-                    .color(crate::theme::colors::ON_PRIMARY),
-            )
-            .fill(crate::theme::colors::PRIMARY_CONTAINER);
-            if ui
-                .add(cap_btn)
-                .on_hover_text("Open Network Interface Capture Workstation (mash-cap)")
-                .clicked()
-            {
-                self.main_view = MainWorkstationView::CaptureWorkstation;
-                self.active_tool = ActiveToolTab::Capture;
+            if self.is_streaming_capture {
+                let stop_btn = egui::Button::new(
+                    RichText::new(format!("⏹ Stop Capture ({} pkts)", self.ws.frames.len()))
+                        .strong()
+                        .color(crate::theme::colors::ON_ERROR),
+                )
+                .fill(crate::theme::colors::ERROR_CONTAINER);
+                if ui
+                    .add(stop_btn)
+                    .on_hover_text("Stop background packet capture stream (Ctrl+E)")
+                    .clicked()
+                {
+                    self.stop_live_capture();
+                }
+                ui.colored_label(
+                    crate::theme::colors::ERROR,
+                    RichText::new("● STREAMING").monospace().small().strong(),
+                );
+            } else {
+                let cap_btn = egui::Button::new(
+                    RichText::new("▶ Live Capture")
+                        .strong()
+                        .color(crate::theme::colors::ON_PRIMARY),
+                )
+                .fill(crate::theme::colors::PRIMARY_CONTAINER);
+                if ui
+                    .add(cap_btn)
+                    .on_hover_text("Open Network Interface Capture Workstation (mash-cap)")
+                    .clicked()
+                {
+                    self.main_view = MainWorkstationView::CaptureWorkstation;
+                    self.active_tool = ActiveToolTab::Capture;
+                }
             }
 
             if ui
@@ -1368,6 +1420,90 @@ impl MashGuiApp {
         }
     }
 
+    pub fn start_live_capture(&mut self) {
+        self.is_streaming_capture = true;
+        self.streaming_seq = self.ws.frames.len() as u64;
+        self.streaming_last_tick = Some(std::time::Instant::now());
+        self.main_view = MainWorkstationView::PacketInspector;
+        let iface_name = self
+            .interfaces
+            .get(self.selected_iface_idx)
+            .map(|i| i.name.as_str())
+            .unwrap_or("eth0");
+        self.status_line = format!(
+            "● LIVE STREAMING ACTIVE on '{iface_name}' — Receiving packets in real-time..."
+        );
+    }
+
+    pub fn stop_live_capture(&mut self) {
+        self.is_streaming_capture = false;
+        self.streaming_last_tick = None;
+        self.rebuild_streams();
+        let total = self.ws.frames.len();
+        self.status_line = format!("Capture stopped. {total} packets in workspace.");
+    }
+
+    pub fn tick_live_capture(&mut self, ctx: &egui::Context) {
+        if !self.is_streaming_capture {
+            return;
+        }
+
+        let now = std::time::Instant::now();
+        let should_emit = match self.streaming_last_tick {
+            Some(last) => now.duration_since(last) >= std::time::Duration::from_millis(65),
+            None => true,
+        };
+
+        if should_emit {
+            self.streaming_last_tick = Some(now);
+
+            // Check non-continuous count limit
+            if !self.capture_continuous && (self.ws.frames.len() as u64) >= self.capture_count {
+                self.stop_live_capture();
+                return;
+            }
+
+            let iface_name = self
+                .interfaces
+                .get(self.selected_iface_idx)
+                .map(|i| i.name.clone())
+                .unwrap_or_else(|| "eth0".to_string());
+
+            let bpf = if self.capture_bpf.trim().is_empty() {
+                None
+            } else {
+                BpfFilter::compile(self.capture_bpf.trim()).ok()
+            };
+
+            for _ in 0..16 {
+                self.streaming_seq += 1;
+                let mut frame =
+                    capture_single_interface_frame(&iface_name, self.streaming_seq);
+                if let Some(ref b) = bpf {
+                    if !b.matches(&frame) {
+                        continue;
+                    }
+                }
+                if (frame.data.len() as u32) > self.capture_snaplen && self.capture_snaplen > 0 {
+                    frame.data.truncate(self.capture_snaplen as usize);
+                    frame.captured_len = frame.data.len() as u32;
+                }
+                let fno = self.ws.frames.len() as u64 + 1;
+                self.ws.push_frame(frame);
+                if self.capture_autoscroll {
+                    self.ws.select_frame(fno);
+                }
+                break;
+            }
+
+            let count = self.ws.frames.len();
+            self.status_line =
+                format!("● LIVE STREAMING: '{iface_name}' ({count} packets captured)");
+        }
+
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+    }
+
     fn run_live_capture(&mut self) {
         let iface_name = self
             .interfaces
@@ -1584,14 +1720,37 @@ impl MashGuiApp {
 
         // Quick Master Action Bar
         ui.horizontal(|ui| {
-            let start_btn = egui::Button::new(
-                RichText::new("▶ Start Capture on Selected Interface")
-                    .color(crate::theme::colors::ON_PRIMARY)
+            if self.is_streaming_capture {
+                let stop_btn = egui::Button::new(
+                    RichText::new(format!(
+                        "⏹ Stop Live Streaming Capture ({} frames captured)",
+                        self.ws.frames.len()
+                    ))
+                    .color(crate::theme::colors::ON_ERROR)
                     .strong(),
-            )
-            .fill(crate::theme::colors::PRIMARY_CONTAINER)
-            .min_size(egui::vec2(280.0, 30.0));
-            if ui.add(start_btn).clicked() {
+                )
+                .fill(crate::theme::colors::ERROR_CONTAINER)
+                .min_size(egui::vec2(300.0, 32.0));
+                if ui.add(stop_btn).clicked() {
+                    self.stop_live_capture();
+                }
+            } else {
+                let start_btn = egui::Button::new(
+                    RichText::new("▶ Start Streaming Live Capture")
+                        .color(crate::theme::colors::ON_PRIMARY)
+                        .strong(),
+                )
+                .fill(crate::theme::colors::PRIMARY_CONTAINER)
+                .min_size(egui::vec2(260.0, 32.0));
+                if ui.add(start_btn).clicked() {
+                    self.start_live_capture();
+                }
+            }
+
+            if ui
+                .button(RichText::new(format!("⚡ Batch Capture ({} pkts)", self.capture_count)).strong())
+                .clicked()
+            {
                 self.run_live_capture();
                 self.main_view = MainWorkstationView::PacketInspector;
             }
@@ -1681,9 +1840,20 @@ impl MashGuiApp {
                                                 ui.colored_label(crate::theme::colors::ON_SURFACE_VARIANT, RichText::new(desc).small());
                                             }
                                             if !iface.addresses.is_empty() {
+                                                let display_addrs: Vec<String> = iface
+                                                    .addresses
+                                                    .iter()
+                                                    .map(|a| {
+                                                        if let Some(gw) = a.strip_prefix("gw:") {
+                                                            format!("GW: {gw}")
+                                                        } else {
+                                                            a.clone()
+                                                        }
+                                                    })
+                                                    .collect();
                                                 ui.colored_label(
                                                     crate::theme::colors::SECONDARY,
-                                                    RichText::new(iface.addresses.join(", ")).monospace().small(),
+                                                    RichText::new(display_addrs.join(", ")).monospace().small(),
                                                 );
                                             }
                                         });
@@ -1808,6 +1978,12 @@ impl MashGuiApp {
                             ui.label("SnapLen Buffer Size (-s):");
                             ui.add(egui::DragValue::new(&mut app.capture_snaplen).range(64..=262_144));
                             ui.colored_label(crate::theme::colors::ON_SURFACE_VARIANT, "bytes");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut app.capture_continuous, "Continuous Live Streaming (dynamic real-time packet arrival)");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut app.capture_autoscroll, "Auto-scroll table to newest captured frame");
                         });
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut app.capture_promisc, "Promiscuous Mode (capture all traffic on wire)");
@@ -2733,6 +2909,8 @@ impl MashGuiApp {
 
 impl eframe::App for MashGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.tick_live_capture(ctx);
+
         if self.dark_mode {
             ctx.set_visuals(crate::theme::enterprise_dark_visuals());
         } else {
@@ -2758,9 +2936,18 @@ impl eframe::App for MashGuiApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     let iface_name = self.interfaces.get(self.selected_iface_idx).map(|i| i.name.as_str()).unwrap_or("eth0");
+                    let stream_badge = if self.is_streaming_capture {
+                        "  [● STREAMING]"
+                    } else {
+                        ""
+                    };
                     ui.colored_label(
-                        crate::theme::colors::ON_SURFACE_VARIANT,
-                        RichText::new(format!("⚡ INTERFACE: {iface_name} (UP)  |  DROPS: 0%  |  STATUS: {}", self.status_line)).monospace().small(),
+                        if self.is_streaming_capture {
+                            crate::theme::colors::PRIMARY
+                        } else {
+                            crate::theme::colors::ON_SURFACE_VARIANT
+                        },
+                        RichText::new(format!("⚡ INTERFACE: {iface_name} (UP){stream_badge}  |  STATUS: {}", self.status_line)).monospace().small(),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.colored_label(
