@@ -189,7 +189,8 @@ impl Dissector for TcpDissector {
             Some(root),
             "tcp.hdr_len",
             hdr_len as u64,
-            r_flags.with_bitmask(0xf000),
+            mash_core::ByteRange::with_source(r_flags.source_idx, r_flags.start, r_flags.start + 1)
+                .with_bitmask(0xf0),
             Some(format!("Header Length: {hdr_len} bytes ({})", hdr_len / 4)),
         );
 

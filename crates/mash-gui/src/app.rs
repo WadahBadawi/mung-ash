@@ -1,12 +1,11 @@
 use crate::{AnalyzerWorkspace, FilterBarStatus};
 use eframe::egui::{
-    self, Color32, FontId, RichText, ScrollArea, Sense, Stroke, TextEdit, TopBottomPanel, Ui,
+    self, Color32, FontId, Key, RichText, ScrollArea, Sense, SidePanel, TextEdit, TopBottomPanel,
+    Ui,
 };
 use egui_extras::{Column, TableBuilder};
 use mash_capture::{capture_frames, list_capture_interfaces, BpfFilter, CaptureOptions};
-use mash_cli::{
-    apply_capture_edits, export_ek_lines, export_pdml, export_psml, EditOptions,
-};
+use mash_cli::{apply_capture_edits, export_ek_lines, export_pdml, export_psml, EditOptions};
 use mash_core::{Frame, InterfaceInfo, LinkType, NodeId, Timestamp};
 use mash_mcp::{JsonRpcRequest, McpServer};
 use mash_pcapfile::text2pcap::{parse_hexdump_packets, Text2PcapOptions};
@@ -23,7 +22,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs;
 
-/// Active tool modal / dock window inside the unified 3-pane desktop GUI.
+/// Active tool panel inside the unified 3-pane desktop GUI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveToolTab {
     Capture,
@@ -53,8 +52,9 @@ pub struct MashGuiApp {
     pub dark_mode: bool,
     pub status_line: String,
 
-    // Active tool window
+    // Active tool drawer / window state
     pub open_tool_window: bool,
+    pub tool_docked: bool,
     pub active_tool: ActiveToolTab,
 
     // 1. Live Capture (`mash-cap`) state
@@ -111,8 +111,9 @@ impl MashGuiApp {
         let mut app = Self {
             ws,
             dark_mode: true,
-            status_line: "Ready — Loaded multi-protocol showcase capture (14 packets). Click any packet, field, or byte to inspect.".to_string(),
+            status_line: "Ready — Loaded multi-protocol showcase capture. Use Up/Down arrows or click any packet, field, or byte.".to_string(),
             open_tool_window: false,
+            tool_docked: true,
             active_tool: ActiveToolTab::Statistics,
             interfaces,
             selected_iface_idx: 0,
@@ -193,13 +194,20 @@ impl MashGuiApp {
                     .next()
                     .and_then(|n| n.value.as_u64())
                     .unwrap_or(0) as u16;
+                let seg_len = pkt
+                    .tree
+                    .by_abbrev("tcp.len")
+                    .next()
+                    .and_then(|n| n.value.as_u64())
+                    .unwrap_or(0) as usize;
                 let payload_start = pkt
                     .tree
                     .by_abbrev("tcp")
                     .next()
                     .map(|n| n.byte_range.end)
                     .unwrap_or(frame.data.len());
-                let payload = frame.data.get(payload_start..).unwrap_or(&[]);
+                let payload_end = payload_start.saturating_add(seg_len).min(frame.data.len());
+                let payload = frame.data.get(payload_start..payload_end).unwrap_or(&[]);
                 self.tcp_streams
                     .entry(sid)
                     .or_insert_with(|| ReassembledStream::new(sid))
@@ -227,13 +235,23 @@ impl MashGuiApp {
                     .next()
                     .and_then(|n| n.value.as_u64())
                     .unwrap_or(0) as u16;
+                let udp_len = pkt
+                    .tree
+                    .by_abbrev("udp.length")
+                    .next()
+                    .and_then(|n| n.value.as_u64())
+                    .unwrap_or(8) as usize;
+                let payload_len = udp_len.saturating_sub(8);
                 let payload_start = pkt
                     .tree
                     .by_abbrev("udp")
                     .next()
                     .map(|n| n.byte_range.end)
                     .unwrap_or(frame.data.len());
-                let payload = frame.data.get(payload_start..).unwrap_or(&[]);
+                let payload_end = payload_start
+                    .saturating_add(payload_len)
+                    .min(frame.data.len());
+                let payload = frame.data.get(payload_start..payload_end).unwrap_or(&[]);
                 self.udp_streams
                     .entry(sid)
                     .or_insert_with(|| ReassembledStream::new(sid))
@@ -253,6 +271,28 @@ impl MashGuiApp {
     fn open_tool(&mut self, tab: ActiveToolTab) {
         self.active_tool = tab;
         self.open_tool_window = true;
+    }
+
+    fn sync_follow_stream_to_packet(&mut self, fno: u64) {
+        if let Some(pkt) = self.ws.dissected.get((fno.saturating_sub(1)) as usize) {
+            if let Some(sid) = pkt
+                .tree
+                .by_abbrev("tcp.stream")
+                .next()
+                .and_then(|n| n.value.as_u64())
+            {
+                self.follow_is_udp = false;
+                self.follow_stream_id = sid as u32;
+            } else if let Some(sid) = pkt
+                .tree
+                .by_abbrev("udp.stream")
+                .next()
+                .and_then(|n| n.value.as_u64())
+            {
+                self.follow_is_udp = true;
+                self.follow_stream_id = sid as u32;
+            }
+        }
     }
 
     fn action_open_file(&mut self) {
@@ -337,12 +377,53 @@ impl MashGuiApp {
             };
             match fs::write(&path, content) {
                 Ok(()) => {
-                    self.status_line =
-                        format!("Exported {} packets as {} to '{}'", displayed.len(), kind.to_uppercase(), path.display());
+                    self.status_line = format!(
+                        "Exported {} packets as {} to '{}'",
+                        displayed.len(),
+                        kind.to_uppercase(),
+                        path.display()
+                    );
                 }
                 Err(e) => self.status_line = format!("Export failed: {e}"),
             }
         }
+    }
+
+    fn handle_keyboard_shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+        ctx.input(|i| {
+            if i.key_pressed(Key::ArrowDown) {
+                if let Some(fno) = self.ws.select_next_displayed_frame() {
+                    self.status_line = format!("Selected Packet #{fno}");
+                }
+            } else if i.key_pressed(Key::ArrowUp) {
+                if let Some(fno) = self.ws.select_prev_displayed_frame() {
+                    self.status_line = format!("Selected Packet #{fno}");
+                }
+            } else if i.key_pressed(Key::Home) {
+                if let Some(fno) = self.ws.select_first_displayed_frame() {
+                    self.status_line = format!("Jumped to first displayed Packet #{fno}");
+                }
+            } else if i.key_pressed(Key::End) {
+                if let Some(fno) = self.ws.select_last_displayed_frame() {
+                    self.status_line = format!("Jumped to last displayed Packet #{fno}");
+                }
+            } else if i.modifiers.ctrl && i.key_pressed(Key::M) {
+                if let Some(fno) = self.ws.selected_frame {
+                    self.ws.toggle_mark_frame(fno);
+                }
+            } else if i.modifiers.ctrl && i.key_pressed(Key::D) {
+                if let Some(fno) = self.ws.selected_frame {
+                    self.ws.toggle_ignore_frame(fno);
+                }
+            } else if i.modifiers.ctrl && i.key_pressed(Key::T) {
+                if let Some(fno) = self.ws.selected_frame {
+                    self.ws.toggle_time_reference(fno);
+                }
+            }
+        });
     }
 
     fn render_menu_bar(&mut self, ui: &mut Ui) {
@@ -356,7 +437,7 @@ impl MashGuiApp {
                     ui.close_menu();
                     self.ws.load_capture(generate_sample_showcase_capture());
                     self.rebuild_streams();
-                    self.status_line = "Loaded 14-packet multi-protocol showcase capture.".to_string();
+                    self.status_line = "Loaded multi-protocol showcase capture.".to_string();
                 }
                 ui.separator();
                 if ui.button("💾 Save All Packets As...").clicked() {
@@ -435,19 +516,25 @@ impl MashGuiApp {
                     ui.close_menu();
                     self.dark_mode = !self.dark_mode;
                 }
-                if ui.button("Expand All Protocol Nodes").clicked() {
+                if ui
+                    .button(if self.tool_docked {
+                        "🗗 Float Tool Suite Window"
+                    } else {
+                        "📌 Dock Tool Suite to Right Side Panel"
+                    })
+                    .clicked()
+                {
                     ui.close_menu();
-                    if let Some(fno) = self.ws.selected_frame {
-                        if let Some(pkt) = self.ws.dissected.get((fno - 1) as usize) {
-                            for n in &pkt.tree.nodes {
-                                self.ws.expanded_nodes.insert(n.id);
-                            }
-                        }
-                    }
+                    self.tool_docked = !self.tool_docked;
                 }
-                if ui.button("Collapse All Protocol Nodes").clicked() {
+                ui.separator();
+                if ui.button("➕ Expand All Protocol Nodes").clicked() {
                     ui.close_menu();
-                    self.ws.expanded_nodes.clear();
+                    self.ws.expand_all_nodes();
+                }
+                if ui.button("➖ Collapse All Protocol Nodes").clicked() {
+                    ui.close_menu();
+                    self.ws.collapse_all_nodes();
                 }
             });
 
@@ -456,7 +543,7 @@ impl MashGuiApp {
                     ui.close_menu();
                     self.open_tool(ActiveToolTab::Capture);
                 }
-                if ui.button("⚡ Quick Capture 20 Packets on Primary Interface").clicked() {
+                if ui.button("⚡ Quick Capture on Primary Interface").clicked() {
                     ui.close_menu();
                     self.run_live_capture();
                 }
@@ -465,6 +552,9 @@ impl MashGuiApp {
             ui.menu_button("Analyze", |ui| {
                 if ui.button("🌊 Follow TCP / UDP Stream...").clicked() {
                     ui.close_menu();
+                    if let Some(fno) = self.ws.selected_frame {
+                        self.sync_follow_stream_to_packet(fno);
+                    }
                     self.open_tool(ActiveToolTab::FollowStream);
                 }
                 if let Some(expr) = self.ws.filter_from_selected_node() {
@@ -482,7 +572,7 @@ impl MashGuiApp {
                     ("Routing (BGP & OSPF)", "bgp || ospf"),
                     ("Industrial / IoT (MQTT & Modbus)", "mqtt || modbus"),
                     ("Enterprise (SMB2 & gRPC)", "smb2 || grpc"),
-                    ("TCP SYN / FIN", "tcp.flags.syn == true || tcp.flags.fin == true"),
+                    ("TCP SYN / FIN / RST", "tcp.flags.syn == true || tcp.flags.fin == true || tcp.flags.rst == true"),
                 ] {
                     if ui.button(format!("{label} ({expr})")).clicked() {
                         ui.close_menu();
@@ -544,12 +634,12 @@ impl MashGuiApp {
 
             if ui
                 .button("⚡ Demo Capture")
-                .on_hover_text("Load 14-packet multi-protocol showcase capture (ARP, DNS, TCP, HTTP, TLS, BGP, MQTT, Modbus, ICMP)")
+                .on_hover_text("Load multi-protocol showcase capture (ARP, DNS, TCP, HTTP, TLS, BGP, MQTT, Modbus, ICMP)")
                 .clicked()
             {
                 self.ws.load_capture(generate_sample_showcase_capture());
                 self.rebuild_streams();
-                self.status_line = "Loaded 14-packet multi-protocol showcase capture.".to_string();
+                self.status_line = "Loaded multi-protocol showcase capture.".to_string();
             }
 
             if ui.button("📂 Open").on_hover_text("Open .pcap / .pcapng file").clicked() {
@@ -561,64 +651,65 @@ impl MashGuiApp {
 
             ui.separator();
 
-            if ui
-                .button("🔍 File Info (mash-info)")
-                .on_hover_text("Inspect SHA-256, timing, and capture metadata")
-                .clicked()
-            {
-                self.open_tool(ActiveToolTab::FileInfo);
-            }
-            if ui
-                .button("✂ Edit / Anonymize (mash-edit)")
-                .on_hover_text("Deduplicate, slice, time-shift, or HMAC-anonymize IPs & MACs")
-                .clicked()
-            {
-                self.open_tool(ActiveToolTab::EditAnonymize);
-            }
-            if ui
-                .button("🔀 Merge (mash-merge)")
-                .on_hover_text("Merge multiple capture files chronologically")
-                .clicked()
-            {
-                self.open_tool(ActiveToolTab::MergeFiles);
-            }
-            if ui
-                .button("📝 Hex2Pcap (mash-text2pcap)")
-                .on_hover_text("Convert ASCII hex dumps into dissected packets")
-                .clicked()
-            {
-                self.open_tool(ActiveToolTab::Text2Pcap);
-            }
-
-            ui.separator();
-
-            if ui
-                .button("🌊 Follow Stream")
-                .on_hover_text("Reassemble and view TCP/UDP payload streams")
-                .clicked()
-            {
-                self.open_tool(ActiveToolTab::FollowStream);
-            }
-            if ui
-                .button("📊 Statistics")
-                .on_hover_text("Protocol Hierarchy, Conversations, Endpoints, I/O Graph, Expert Info")
-                .clicked()
-            {
-                self.open_tool(ActiveToolTab::Statistics);
-            }
-            if ui
-                .button("🤖 AI Analyst (mash-ai)")
-                .on_hover_text("AI Packet Explainer, Anomaly Detector & NL Filter")
-                .clicked()
-            {
-                self.open_tool(ActiveToolTab::AiAnalyst);
-            }
-            if ui
-                .button("🔌 MCP Server (mash-mcp)")
-                .on_hover_text("Test Model Context Protocol JSON-RPC 2.0 tools")
-                .clicked()
-            {
-                self.open_tool(ActiveToolTab::McpInspector);
+            for (tab, label, tip) in [
+                (
+                    ActiveToolTab::FileInfo,
+                    "🔍 File Info (mash-info)",
+                    "Inspect SHA-256, timing, and capture metadata",
+                ),
+                (
+                    ActiveToolTab::EditAnonymize,
+                    "✂ Edit / Scrub (mash-edit)",
+                    "Deduplicate, slice, time-shift, or HMAC-anonymize IPs & MACs",
+                ),
+                (
+                    ActiveToolTab::MergeFiles,
+                    "🔀 Merge (mash-merge)",
+                    "Merge multiple capture files chronologically",
+                ),
+                (
+                    ActiveToolTab::Text2Pcap,
+                    "📝 Hex2Pcap (mash-text2pcap)",
+                    "Convert ASCII hex dumps into dissected packets",
+                ),
+                (
+                    ActiveToolTab::FollowStream,
+                    "🌊 Follow Stream",
+                    "Reassemble and view TCP/UDP payload streams",
+                ),
+                (
+                    ActiveToolTab::Statistics,
+                    "📊 Statistics",
+                    "Protocol Hierarchy, Conversations, Endpoints, I/O Graph, Expert Info",
+                ),
+                (
+                    ActiveToolTab::AiAnalyst,
+                    "🤖 AI Analyst (mash-ai)",
+                    "AI Packet Explainer, Anomaly Detector & NL Filter",
+                ),
+                (
+                    ActiveToolTab::McpInspector,
+                    "🔌 MCP Console (mash-mcp)",
+                    "Test Model Context Protocol JSON-RPC 2.0 tools",
+                ),
+            ] {
+                let is_active = self.open_tool_window && self.active_tool == tab;
+                if ui
+                    .selectable_label(is_active, label)
+                    .on_hover_text(tip)
+                    .clicked()
+                {
+                    if is_active {
+                        self.open_tool_window = false;
+                    } else {
+                        if tab == ActiveToolTab::FollowStream {
+                            if let Some(fno) = self.ws.selected_frame {
+                                self.sync_follow_stream_to_packet(fno);
+                            }
+                        }
+                        self.open_tool(tab);
+                    }
+                }
             }
         });
     }
@@ -627,50 +718,96 @@ impl MashGuiApp {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Filter:").strong());
 
-            let bg_color = match &self.ws.filter_status {
-                FilterBarStatus::Empty => {
+            let (bg_color, badge_text, badge_color) = match &self.ws.filter_status {
+                FilterBarStatus::Empty => (
                     if self.dark_mode {
                         Color32::from_rgb(35, 38, 45)
                     } else {
                         Color32::from_rgb(245, 245, 250)
-                    }
-                }
-                FilterBarStatus::Valid => {
+                    },
+                    "ALL",
+                    Color32::from_rgb(140, 150, 165),
+                ),
+                FilterBarStatus::Valid => (
                     if self.dark_mode {
-                        Color32::from_rgb(22, 72, 38)
+                        Color32::from_rgb(20, 68, 36)
                     } else {
                         Color32::from_rgb(205, 245, 210)
-                    }
-                }
-                FilterBarStatus::Invalid(_) => {
+                    },
+                    "✓ VALID",
+                    Color32::from_rgb(90, 230, 125),
+                ),
+                FilterBarStatus::Invalid(_) => (
                     if self.dark_mode {
-                        Color32::from_rgb(95, 25, 28)
+                        Color32::from_rgb(92, 24, 28)
                     } else {
                         Color32::from_rgb(255, 210, 210)
-                    }
-                }
+                    },
+                    "✖ SYNTAX",
+                    Color32::from_rgb(255, 110, 110),
+                ),
             };
 
             let mut expr = self.ws.filter_input.clone();
+            let input_w = (ui.available_width() - 470.0).max(180.0);
             let edit = TextEdit::singleline(&mut expr)
-                .hint_text("Apply a display filter... e.g. http || dns || tcp.port == 443 || bgp || mqtt")
+                .hint_text("Display filter... e.g. http || dns || tcp.port == 443 || bgp || mqtt")
+                .font(FontId::monospace(13.0))
                 .background_color(bg_color)
-                .desired_width(ui.available_width() - 280.0);
+                .desired_width(input_w);
             let resp = ui.add(edit);
             if resp.changed() {
                 self.ws.set_display_filter(&expr);
             }
 
-            if ui.button("✖ Clear").clicked() {
+            ui.colored_label(badge_color, RichText::new(badge_text).small().strong());
+
+            if ui
+                .button("✖ Clear")
+                .on_hover_text("Reset display filter and show all packets")
+                .clicked()
+            {
                 self.ws.set_display_filter("");
             }
 
-            for preset in ["http", "dns", "tls", "tcp", "bgp", "mqtt", "modbus"] {
-                if ui.small_button(preset).clicked() {
+            ui.separator();
+            for (label, preset) in [
+                ("All", ""),
+                ("HTTP", "http"),
+                ("DNS", "dns"),
+                ("TLS", "tls"),
+                ("TCP", "tcp"),
+                ("UDP", "udp"),
+                ("ARP", "arp"),
+                ("BGP", "bgp"),
+                ("MQTT", "mqtt"),
+                ("Modbus", "modbus"),
+                ("ICMP", "icmp"),
+            ] {
+                let active = self.ws.filter_input.trim() == preset;
+                if ui.selectable_label(active, RichText::new(label).small()).clicked() {
                     self.ws.set_display_filter(preset);
                 }
             }
         });
+
+        // Show autocomplete chips when typing a field identifier
+        let trimmed = self.ws.filter_input.trim();
+        if !trimmed.is_empty() && !trimmed.contains(' ') {
+            let suggestions = self.ws.autocomplete(6);
+            if !suggestions.is_empty()
+                && (suggestions.len() > 1 || suggestions[0] != trimmed)
+            {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Autocomplete:").small().weak());
+                    for sug in suggestions {
+                        if ui.small_button(&sug).clicked() {
+                            self.ws.set_display_filter(&sug);
+                        }
+                    }
+                });
+            }
+        }
 
         if let FilterBarStatus::Invalid(diag) = self.ws.filter_status.clone() {
             ui.horizontal(|ui| {
@@ -678,7 +815,7 @@ impl MashGuiApp {
                     Color32::from_rgb(255, 110, 110),
                     format!("⚠ Filter Syntax Error: {}", diag.message),
                 );
-                if let Some(sug) = diag.suggestions.first() {
+                for sug in diag.suggestions.iter().take(3) {
                     if ui.small_button(format!("Did you mean '{sug}'?")).clicked() {
                         self.ws.set_display_filter(sug);
                     }
@@ -688,22 +825,24 @@ impl MashGuiApp {
     }
 
     fn render_packet_list_pane(&mut self, ui: &mut Ui) {
-        let row_height = 20.0;
+        let row_height = 21.0;
         let total_rows = self.ws.filtered_indices.len();
         let mut clicked_frame: Option<u64> = None;
+        let mut double_clicked_frame: Option<u64> = None;
         let mut context_action: Option<(u64, &'static str)> = None;
 
         TableBuilder::new(ui)
             .striped(true)
             .resizable(true)
+            .sense(Sense::click())
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(Column::initial(55.0).at_least(40.0)) // No.
-            .column(Column::initial(95.0).at_least(70.0)) // Time
-            .column(Column::initial(145.0).at_least(90.0)) // Source
-            .column(Column::initial(145.0).at_least(90.0)) // Destination
-            .column(Column::initial(80.0).at_least(55.0)) // Protocol
-            .column(Column::initial(65.0).at_least(50.0)) // Length
-            .column(Column::remainder().at_least(200.0)) // Info
+            .column(Column::initial(58.0).at_least(42.0)) // No.
+            .column(Column::initial(95.0).at_least(72.0)) // Time
+            .column(Column::initial(150.0).at_least(95.0)) // Source
+            .column(Column::initial(150.0).at_least(95.0)) // Destination
+            .column(Column::initial(85.0).at_least(58.0)) // Protocol
+            .column(Column::initial(64.0).at_least(48.0)) // Length
+            .column(Column::remainder().at_least(220.0)) // Info
             .header(22.0, |mut header| {
                 for title in [
                     "No.",
@@ -730,12 +869,17 @@ impl MashGuiApp {
                     };
                     let fno = pkt.summary.number;
                     let is_selected = self.ws.selected_frame == Some(fno);
+                    let is_marked = self
+                        .ws
+                        .frames
+                        .get(pkt_idx)
+                        .is_some_and(|f| f.flags.marked);
                     row.set_selected(is_selected);
 
-                    let (fg_color, badge_bg) = if is_selected {
+                    let (fg_color, proto_bg) = if is_selected {
                         (
                             Color32::from_rgb(255, 255, 255),
-                            Color32::from_rgb(20, 95, 190),
+                            Color32::from_rgb(28, 105, 205),
                         )
                     } else if let Some((fg, bg)) = self.ws.color_for_packet(pkt) {
                         (
@@ -751,8 +895,13 @@ impl MashGuiApp {
                         (fg, Color32::TRANSPARENT)
                     };
 
+                    let no_str = if is_marked {
+                        format!("★ {fno}")
+                    } else {
+                        format!("{fno}")
+                    };
                     let cols = [
-                        format!("{fno}"),
+                        no_str,
                         format!("{:.6}", pkt.summary.rel_time_sec),
                         pkt.summary.source.clone(),
                         pkt.summary.destination.clone(),
@@ -763,50 +912,87 @@ impl MashGuiApp {
 
                     for (c_idx, text) in cols.iter().enumerate() {
                         row.col(|ui| {
-                            let rt = if c_idx == 4 && badge_bg != Color32::TRANSPARENT {
+                            let rt = if c_idx == 4 && proto_bg != Color32::TRANSPARENT {
                                 RichText::new(format!(" {text} "))
                                     .monospace()
                                     .color(fg_color)
-                                    .background_color(badge_bg)
+                                    .background_color(proto_bg)
                             } else {
                                 RichText::new(text).monospace().color(fg_color)
                             };
-                            let resp = ui.add(egui::Label::new(rt).sense(Sense::click()));
-                            if resp.clicked() {
+                            let lbl_resp = ui.add(egui::Label::new(rt). truncate().sense(Sense::click()));
+                            if lbl_resp.clicked() {
                                 clicked_frame = Some(fno);
                             }
-                            resp.context_menu(|ui| {
-                                if ui.button("🔖 Mark / Unmark Packet").clicked() {
-                                    context_action = Some((fno, "mark"));
-                                    ui.close_menu();
-                                }
-                                if ui.button("⏱ Set / Unset Time Reference").clicked() {
-                                    context_action = Some((fno, "timeref"));
-                                    ui.close_menu();
-                                }
-                                if ui.button("🌊 Follow Stream").clicked() {
-                                    context_action = Some((fno, "follow"));
-                                    ui.close_menu();
-                                }
-                                if ui.button("🤖 Explain Packet with AI").clicked() {
-                                    context_action = Some((fno, "ai"));
-                                    ui.close_menu();
-                                }
-                            });
+                            if lbl_resp.double_clicked() {
+                                double_clicked_frame = Some(fno);
+                            }
                         });
                     }
+
+                    let r_resp = row.response();
+                    if r_resp.clicked() {
+                        clicked_frame = Some(fno);
+                    }
+                    if r_resp.double_clicked() {
+                        double_clicked_frame = Some(fno);
+                    }
+                    r_resp.context_menu(|ui| {
+                        ui.label(RichText::new(format!("Packet #{fno} ({})", pkt.summary.protocol)).strong());
+                        ui.separator();
+                        if ui.button("🔖 Mark / Unmark Packet (Ctrl+M)").clicked() {
+                            context_action = Some((fno, "mark"));
+                            ui.close_menu();
+                        }
+                        if ui.button("⏱ Set / Unset Time Reference (Ctrl+T)").clicked() {
+                            context_action = Some((fno, "timeref"));
+                            ui.close_menu();
+                        }
+                        if ui.button("🚫 Ignore Packet (Ctrl+D)").clicked() {
+                            context_action = Some((fno, "ignore"));
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("🌊 Follow TCP / UDP Stream").clicked() {
+                            context_action = Some((fno, "follow"));
+                            ui.close_menu();
+                        }
+                        if ui.button("🤖 Explain Packet with AI").clicked() {
+                            context_action = Some((fno, "ai"));
+                            ui.close_menu();
+                        }
+                    });
                 });
             });
 
         if let Some(fno) = clicked_frame {
             self.ws.select_frame(fno);
+            if let Some(pkt) = self.ws.dissected.get((fno - 1) as usize) {
+                self.status_line = format!(
+                    "Packet #{fno}: {} -> {} ({}, {} bytes) — {}",
+                    pkt.summary.source,
+                    pkt.summary.destination,
+                    pkt.summary.protocol,
+                    pkt.summary.length,
+                    pkt.summary.info
+                );
+            }
+        }
+        if let Some(fno) = double_clicked_frame {
+            self.ws.select_frame(fno);
+            self.sync_follow_stream_to_packet(fno);
+            self.open_tool(ActiveToolTab::FollowStream);
         }
         if let Some((fno, act)) = context_action {
             self.ws.select_frame(fno);
             match act {
                 "mark" => self.ws.toggle_mark_frame(fno),
                 "timeref" => self.ws.toggle_time_reference(fno),
-                "follow" => self.open_tool(ActiveToolTab::FollowStream),
+                "ignore" => self.ws.toggle_ignore_frame(fno),
+                "follow" => {
+                    self.sync_follow_stream_to_packet(fno);
+                    self.open_tool(ActiveToolTab::FollowStream);
+                }
                 "ai" => {
                     if let Some(pkt) = self.ws.dissected.get((fno - 1) as usize) {
                         if let Ok(exp) = self.ws.ai.explain_packet(pkt) {
@@ -822,7 +1008,7 @@ impl MashGuiApp {
 
     fn render_protocol_tree_pane(&mut self, ui: &mut Ui) {
         let Some(fno) = self.ws.selected_frame else {
-            ui.label("Select a packet in the Packet List above to inspect its protocol tree.");
+            ui.label("No packet selected. Click a packet in the Packet List above.");
             return;
         };
         let Some(pkt) = self.ws.dissected.get((fno - 1) as usize).cloned() else {
@@ -850,26 +1036,22 @@ impl MashGuiApp {
             return;
         };
         let has_children = !node.children.is_empty();
-        let is_expanded = self.ws.expanded_nodes.contains(&node_id) || depth == 0 && self.ws.expanded_nodes.is_empty();
+        let is_expanded = self.ws.is_node_expanded(node_id, &node.abbrev);
         let is_selected = self.ws.selected_node == Some(node_id);
 
         ui.horizontal(|ui| {
-            ui.add_space((depth as f32) * 18.0);
+            ui.add_space((depth as f32) * 16.0);
             if has_children {
                 let icon = if is_expanded { "▼" } else { "▶" };
                 if ui.small_button(icon).clicked() {
-                    if self.ws.expanded_nodes.contains(&node_id) {
-                        self.ws.expanded_nodes.remove(&node_id);
-                    } else {
-                        self.ws.expanded_nodes.insert(node_id);
-                    }
+                    self.ws.toggle_node_expanded(node_id, &node.abbrev);
                 }
             } else {
                 ui.add_space(22.0);
             }
 
             let label_color = if is_selected {
-                Color32::from_rgb(255, 230, 120)
+                Color32::from_rgb(255, 235, 130)
             } else if depth == 0 {
                 if self.dark_mode {
                     Color32::from_rgb(155, 210, 255)
@@ -883,7 +1065,7 @@ impl MashGuiApp {
             };
 
             let bg = if is_selected {
-                Color32::from_rgb(35, 75, 135)
+                Color32::from_rgb(30, 80, 150)
             } else {
                 Color32::TRANSPARENT
             };
@@ -895,8 +1077,8 @@ impl MashGuiApp {
             let resp = ui.add(egui::Label::new(text).sense(Sense::click()));
             if resp.clicked() {
                 self.ws.select_field_node(node_id);
-                if has_children {
-                    self.ws.expanded_nodes.insert(node_id);
+                if has_children && depth > 0 {
+                    self.ws.toggle_node_expanded(node_id, &node.abbrev);
                 }
                 self.status_line = format!(
                     "{} ({}) — Bytes {}..{} ({} bytes)",
@@ -907,8 +1089,13 @@ impl MashGuiApp {
                     node.byte_range.len()
                 );
             }
+            if resp.double_clicked() && has_children {
+                self.ws.toggle_node_expanded(node_id, &node.abbrev);
+            }
             resp.context_menu(|ui| {
-                if ui.button("🔍 Apply as Filter").clicked() {
+                ui.label(RichText::new(&node.abbrev).monospace().strong());
+                ui.separator();
+                if ui.button("🔍 Apply as Display Filter").clicked() {
                     self.ws.select_field_node(node_id);
                     if let Some(f) = self.ws.filter_from_selected_node() {
                         self.ws.set_display_filter(&f);
@@ -960,33 +1147,6 @@ impl MashGuiApp {
             return;
         };
 
-        // Data source tab bar (Frame Bytes + Secondary DataSources)
-        ui.horizontal(|ui| {
-            let tab0_selected = self.ws.active_source_tab == 0;
-            if ui
-                .selectable_label(
-                    tab0_selected,
-                    format!("Frame ({} bytes)", frame.data.len()),
-                )
-                .clicked()
-            {
-                self.ws.active_source_tab = 0;
-            }
-            for (idx, ds) in frame.extra_sources.iter().enumerate() {
-                let tab_id = (idx + 1) as u8;
-                if ui
-                    .selectable_label(
-                        self.ws.active_source_tab == tab_id,
-                        format!("{} ({} bytes)", ds.name, ds.data.len()),
-                    )
-                    .clicked()
-                {
-                    self.ws.active_source_tab = tab_id;
-                }
-            }
-        });
-        ui.separator();
-
         let Some(bytes) = frame.source_bytes(self.ws.active_source_tab).map(|b| b.to_vec()) else {
             return;
         };
@@ -994,16 +1154,25 @@ impl MashGuiApp {
         let active_src = self.ws.active_source_tab;
         let mut clicked_offset: Option<usize> = None;
 
+        ui.label(
+            RichText::new("Offset   00 01 02 03 04 05 06 07   08 09 0A 0B 0C 0D 0E 0F    Decoded ASCII")
+                .monospace()
+                .small()
+                .color(Color32::from_rgb(135, 150, 175)),
+        );
+        ui.separator();
+
         ScrollArea::vertical()
             .id_salt("pane3_hexdump")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.style_mut().spacing.item_spacing.x = 4.0;
+                ui.style_mut().spacing.item_spacing.y = 2.0;
                 for (row_idx, chunk) in bytes.chunks(16).enumerate() {
                     let row_base = row_idx * 16;
                     ui.horizontal(|ui| {
                         ui.label(
-                            RichText::new(format!("{row_base:04x}  "))
+                            RichText::new(format!("{row_base:04x}   "))
                                 .monospace()
                                 .color(Color32::from_rgb(130, 145, 165)),
                         );
@@ -1027,7 +1196,12 @@ impl MashGuiApp {
                                         .background_color(Color32::from_rgb(25, 95, 195))
                                         .strong();
                                 }
-                                if ui.add(egui::Label::new(rt).sense(Sense::click())).clicked() {
+                                let resp = ui
+                                    .add(egui::Label::new(rt).sense(Sense::click()))
+                                    .on_hover_text(format!(
+                                        "Offset: 0x{abs_off:04x} ({abs_off}) | Dec: {b} | Bin: {b:08b}"
+                                    ));
+                                if resp.clicked() {
                                     clicked_offset = Some(abs_off);
                                 }
                             } else {
@@ -1068,7 +1242,7 @@ impl MashGuiApp {
                 if let Some(pkt) = self.ws.dissected.get((fno - 1) as usize) {
                     if let Some(node) = pkt.tree.node(nid) {
                         self.status_line = format!(
-                            "Selected byte 0x{off:04x} -> {} ({}) [Bytes {}..{}]",
+                            "Selected byte 0x{off:04x} ({off}) -> {} ({}) [Bytes {}..{}]",
                             node.name, node.abbrev, node.byte_range.start, node.byte_range.end
                         );
                     }
@@ -1112,49 +1286,92 @@ impl MashGuiApp {
         }
     }
 
-    fn render_tool_window(&mut self, ctx: &egui::Context) {
+    fn render_tool_contents(&mut self, ui: &mut Ui) {
+        ui.horizontal_wrapped(|ui| {
+            for (tab, label) in [
+                (ActiveToolTab::Capture, "▶ Capture"),
+                (ActiveToolTab::FileInfo, "🔍 File Info"),
+                (ActiveToolTab::EditAnonymize, "✂ Edit & Scrub"),
+                (ActiveToolTab::MergeFiles, "🔀 Merge"),
+                (ActiveToolTab::Text2Pcap, "📝 Hex2Pcap"),
+                (ActiveToolTab::FollowStream, "🌊 Follow Stream"),
+                (ActiveToolTab::Statistics, "📊 Statistics"),
+                (ActiveToolTab::AiAnalyst, "🤖 AI Analyst"),
+                (ActiveToolTab::McpInspector, "🔌 MCP Console"),
+            ] {
+                if ui.selectable_label(self.active_tool == tab, label).clicked() {
+                    self.active_tool = tab;
+                }
+            }
+        });
+        ui.separator();
+
+        match self.active_tool {
+            ActiveToolTab::Capture => self.ui_tool_capture(ui),
+            ActiveToolTab::FileInfo => self.ui_tool_file_info(ui),
+            ActiveToolTab::EditAnonymize => self.ui_tool_edit_anonymize(ui),
+            ActiveToolTab::MergeFiles => self.ui_tool_merge(ui),
+            ActiveToolTab::Text2Pcap => self.ui_tool_text2pcap(ui),
+            ActiveToolTab::FollowStream => self.ui_tool_follow_stream(ui),
+            ActiveToolTab::Statistics => self.ui_tool_statistics(ui),
+            ActiveToolTab::AiAnalyst => self.ui_tool_ai_analyst(ui),
+            ActiveToolTab::McpInspector => self.ui_tool_mcp_inspector(ui),
+        }
+    }
+
+    fn render_tool_panel_or_window(&mut self, ctx: &egui::Context) {
         if !self.open_tool_window {
             return;
         }
-        let mut is_open = self.open_tool_window;
-        egui::Window::new("🛠 MUNG-ASH All-in-One Tool Suite")
-            .open(&mut is_open)
-            .resizable(true)
-            .default_width(780.0)
-            .default_height(520.0)
-            .show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for (tab, label) in [
-                        (ActiveToolTab::Capture, "▶ Capture (mash-cap)"),
-                        (ActiveToolTab::FileInfo, "🔍 File Info (mash-info)"),
-                        (ActiveToolTab::EditAnonymize, "✂ Edit & Scrub (mash-edit)"),
-                        (ActiveToolTab::MergeFiles, "🔀 Merge (mash-merge)"),
-                        (ActiveToolTab::Text2Pcap, "📝 Hex2Pcap (mash-text2pcap)"),
-                        (ActiveToolTab::FollowStream, "🌊 Follow Stream"),
-                        (ActiveToolTab::Statistics, "📊 Statistics"),
-                        (ActiveToolTab::AiAnalyst, "🤖 AI Analyst (mash-ai)"),
-                        (ActiveToolTab::McpInspector, "🔌 MCP Console (mash-mcp)"),
-                    ] {
-                        if ui.selectable_label(self.active_tool == tab, label).clicked() {
-                            self.active_tool = tab;
-                        }
-                    }
+        if self.tool_docked {
+            SidePanel::right("mash_docked_tool_drawer")
+                .resizable(true)
+                .default_width(520.0)
+                .min_width(360.0)
+                .max_width(820.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading("🛠 MUNG-ASH Tool Suite");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("✖ Close").clicked() {
+                                self.open_tool_window = false;
+                            }
+                            if ui
+                                .small_button("🗗 Float")
+                                .on_hover_text("Detach into a floating window")
+                                .clicked()
+                            {
+                                self.tool_docked = false;
+                            }
+                        });
+                    });
+                    ui.separator();
+                    self.render_tool_contents(ui);
                 });
-                ui.separator();
-
-                match self.active_tool {
-                    ActiveToolTab::Capture => self.ui_tool_capture(ui),
-                    ActiveToolTab::FileInfo => self.ui_tool_file_info(ui),
-                    ActiveToolTab::EditAnonymize => self.ui_tool_edit_anonymize(ui),
-                    ActiveToolTab::MergeFiles => self.ui_tool_merge(ui),
-                    ActiveToolTab::Text2Pcap => self.ui_tool_text2pcap(ui),
-                    ActiveToolTab::FollowStream => self.ui_tool_follow_stream(ui),
-                    ActiveToolTab::Statistics => self.ui_tool_statistics(ui),
-                    ActiveToolTab::AiAnalyst => self.ui_tool_ai_analyst(ui),
-                    ActiveToolTab::McpInspector => self.ui_tool_mcp_inspector(ui),
-                }
-            });
-        self.open_tool_window = is_open;
+        } else {
+            let mut is_open = self.open_tool_window;
+            let mut dock_requested = false;
+            egui::Window::new("🛠 MUNG-ASH All-in-One Tool Suite")
+                .open(&mut is_open)
+                .resizable(true)
+                .default_width(760.0)
+                .default_height(500.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .small_button("📌 Dock to Right Side Panel")
+                            .clicked()
+                        {
+                            dock_requested = true;
+                        }
+                    });
+                    self.render_tool_contents(ui);
+                });
+            self.open_tool_window = is_open;
+            if dock_requested {
+                self.tool_docked = true;
+            }
+        }
     }
 
     fn ui_tool_capture(&mut self, ui: &mut Ui) {
@@ -1204,12 +1421,12 @@ impl MashGuiApp {
                 self.run_live_capture();
             }
             if ui
-                .button("⚡ Load Multi-Protocol Showcase Capture (14 Packets)")
+                .button("⚡ Load Multi-Protocol Showcase Capture")
                 .clicked()
             {
                 self.ws.load_capture(generate_sample_showcase_capture());
                 self.rebuild_streams();
-                self.status_line = "Loaded 14-packet multi-protocol showcase capture.".to_string();
+                self.status_line = "Loaded multi-protocol showcase capture.".to_string();
             }
         });
     }
@@ -1301,7 +1518,7 @@ impl MashGuiApp {
             self.ws.load_capture(cap);
             self.rebuild_streams();
             self.status_line = format!(
-                "Applied mash-edit transformations ({} packets remaining).",
+                "Applied mash-edit transformations ({} packets in workspace).",
                 self.ws.frames.len()
             );
         }
@@ -1395,7 +1612,7 @@ impl MashGuiApp {
                 self.rebuild_streams();
                 self.status_line = format!("Imported {count} packet(s) from hex dump.");
             }
-            if ui.button("➕ Append Hex Dump Packet to Current Capture").clicked() {
+            if ui.button("➕ Append Packet to Current Capture").clicked() {
                 let opts = if self.text2pcap_use_udp {
                     Text2PcapOptions {
                         prepend_udp_ports: Some((self.text2pcap_src_port, self.text2pcap_dst_port)),
@@ -1410,10 +1627,7 @@ impl MashGuiApp {
                 let mut frames = parse_hexdump_packets(&self.text2pcap_input, &opts);
                 let mut cap = CaptureFile::new(CaptureFormat::PcapNg);
                 cap.frames = self.ws.frames.clone();
-                for mut f in frames.drain(..) {
-                    f.number = (cap.frames.len() + 1) as u64;
-                    cap.frames.push(f);
-                }
+                cap.frames.append(&mut frames);
                 self.ws.load_capture(cap);
                 self.rebuild_streams();
             }
@@ -1422,7 +1636,7 @@ impl MashGuiApp {
 
     fn ui_tool_follow_stream(&mut self, ui: &mut Ui) {
         ui.heading("Follow TCP / UDP Stream Reassembly");
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.checkbox(&mut self.follow_is_udp, "UDP Stream (uncheck for TCP)");
             ui.label("Stream Index:");
             ui.add(egui::DragValue::new(&mut self.follow_stream_id));
@@ -1435,7 +1649,7 @@ impl MashGuiApp {
                     self.follow_format = fmt;
                 }
             }
-            if ui.button("🔍 Filter This Stream in Packet List").clicked() {
+            if ui.button("🔍 Filter This Stream").clicked() {
                 let f = if self.follow_is_udp {
                     format!("udp.stream == {}", self.follow_stream_id)
                 } else {
@@ -1455,7 +1669,7 @@ impl MashGuiApp {
             if let Some(st) = stream_opt {
                 ui.monospace(st.format_stream(self.follow_format));
             } else {
-                ui.label("No stream data found for the selected stream ID.");
+                ui.label("No payload data found for this stream ID.");
             }
         });
     }
@@ -1577,7 +1791,7 @@ impl MashGuiApp {
         ui.horizontal(|ui| {
             ui.label("Natural Language Filter:");
             ui.text_edit_singleline(&mut self.ai_nl_query);
-            if ui.button("✨ Compile & Apply Filter").clicked() {
+            if ui.button("✨ Compile & Apply").clicked() {
                 match self
                     .ws
                     .ai
@@ -1594,8 +1808,8 @@ impl MashGuiApp {
                 }
             }
         });
-        ui.horizontal(|ui| {
-            if ui.button("🤖 Explain Currently Selected Packet").clicked() {
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("🤖 Explain Selected Packet").clicked() {
                 if let Some(fno) = self.ws.selected_frame {
                     if let Some(pkt) = self.ws.dissected.get((fno - 1) as usize) {
                         if let Ok(text) = self.ws.ai.explain_packet(pkt) {
@@ -1604,10 +1818,7 @@ impl MashGuiApp {
                     }
                 }
             }
-            if ui
-                .button("📋 Generate Full Capture Security & Anomaly Summary")
-                .clicked()
-            {
+            if ui.button("📋 Full Capture Security Summary").clicked() {
                 let mut cap = CaptureFile::new(CaptureFormat::PcapNg);
                 cap.frames = self.ws.frames.clone();
                 let props = CaptureProperties::from_capture(&cap, None);
@@ -1672,8 +1883,7 @@ impl MashGuiApp {
                     }
                 };
                 let resp = srv.handle_request(req);
-                self.mcp_response_json =
-                    serde_json::to_string_pretty(&resp).unwrap_or_default();
+                self.mcp_response_json = serde_json::to_string_pretty(&resp).unwrap_or_default();
             }
         });
         ui.separator();
@@ -1691,7 +1901,9 @@ impl eframe::App for MashGuiApp {
             ctx.set_visuals(egui::Visuals::light());
         }
 
-        // Top Menu Bar + Toolbar + Display Filter Bar
+        self.handle_keyboard_shortcuts(ctx);
+
+        // 1. Top Menu Bar + Toolbar + Display Filter Bar
         TopBottomPanel::top("mash_top_bars").show(ctx, |ui| {
             self.render_menu_bar(ui);
             ui.separator();
@@ -1700,7 +1912,7 @@ impl eframe::App for MashGuiApp {
             self.render_filter_bar(ui);
         });
 
-        // Bottom Status Bar
+        // 2. Bottom Status Bar
         TopBottomPanel::bottom("mash_status_bar")
             .exact_height(24.0)
             .show(ctx, |ui| {
@@ -1726,35 +1938,98 @@ impl eframe::App for MashGuiApp {
                 });
             });
 
-        // Pane 3 (Bottom Split): Synchronized Hex + ASCII Packet Bytes
+        // 3. Dockable Right Tool Drawer (or Floating Window)
+        self.render_tool_panel_or_window(ctx);
+
+        let win_h = ctx.screen_rect().height();
+        let max_subpane_h = (win_h * 0.36).max(120.0);
+
+        // 4. Pane 3 (Bottom Split): Synchronized Hex + ASCII Packet Bytes
         TopBottomPanel::bottom("pane3_packet_bytes")
             .resizable(true)
-            .default_height(195.0)
-            .min_height(100.0)
+            .default_height(185.0)
+            .min_height(95.0)
+            .max_height(max_subpane_h)
             .show(ctx, |ui| {
-                ui.heading("Packet Bytes (Hex / ASCII — Click any byte to jump to field)");
+                ui.horizontal(|ui| {
+                    ui.strong("Packet Bytes (Hex / ASCII)");
+                    if let Some(fno) = self.ws.selected_frame {
+                        if let Some(frame) = self.ws.frames.get((fno - 1) as usize) {
+                            ui.separator();
+                            if ui
+                                .selectable_label(
+                                    self.ws.active_source_tab == 0,
+                                    format!("Frame ({} B)", frame.data.len()),
+                                )
+                                .clicked()
+                            {
+                                self.ws.active_source_tab = 0;
+                            }
+                            for (idx, ds) in frame.extra_sources.iter().enumerate() {
+                                let tab_id = (idx + 1) as u8;
+                                if ui
+                                    .selectable_label(
+                                        self.ws.active_source_tab == tab_id,
+                                        format!("{} ({} B)", ds.name, ds.data.len()),
+                                    )
+                                    .clicked()
+                                {
+                                    self.ws.active_source_tab = tab_id;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(hl) = self.ws.highlighted_bytes {
+                        ui.separator();
+                        ui.colored_label(
+                            Color32::from_rgb(120, 200, 255),
+                            format!("Highlighted: {}..{} ({} B)", hl.start, hl.end, hl.len()),
+                        );
+                    }
+                });
+                ui.separator();
                 self.render_hex_dump_pane(ui);
             });
 
-        // Pane 2 (Middle Split): Hierarchical Protocol Tree
+        // 5. Pane 2 (Middle Split): Hierarchical Protocol Tree
         TopBottomPanel::bottom("pane2_protocol_tree")
             .resizable(true)
-            .default_height(225.0)
-            .min_height(110.0)
+            .default_height(215.0)
+            .min_height(105.0)
+            .max_height(max_subpane_h)
             .show(ctx, |ui| {
-                ui.heading("Packet Details (Protocol Tree — Click any field to highlight bytes, Right-click to filter)");
+                ui.horizontal(|ui| {
+                    if let Some(fno) = self.ws.selected_frame {
+                        ui.strong(format!("Packet Details — Frame #{fno}"));
+                    } else {
+                        ui.strong("Packet Details");
+                    }
+                    ui.separator();
+                    if ui.small_button("➕ Expand All").clicked() {
+                        self.ws.expand_all_nodes();
+                    }
+                    if ui.small_button("➖ Collapse All").clicked() {
+                        self.ws.collapse_all_nodes();
+                    }
+                    if let Some(expr) = self.ws.filter_from_selected_node() {
+                        ui.separator();
+                        if ui
+                            .small_button(format!("🔍 Filter: {expr}"))
+                            .on_hover_text("Apply selected field as display filter")
+                            .clicked()
+                        {
+                            self.ws.set_display_filter(&expr);
+                        }
+                    }
+                });
                 ui.separator();
                 self.render_protocol_tree_pane(ui);
             });
 
-        // Pane 1 (Top Central Split): Packet List Table
+        // 6. Pane 1 (Top Central Split): Packet List Table
         egui::CentralPanel::default().show(ctx, |ui| {
-            let _ = Stroke::NONE;
             self.render_packet_list_pane(ui);
         });
-
-        // Floating All-in-One Tool Suite Window
-        self.render_tool_window(ctx);
     }
 }
 
@@ -1763,8 +2038,8 @@ pub fn run_native_gui(ws: AnalyzerWorkspace) -> std::result::Result<(), String> 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("MUNG-ASH Network Protocol Analyzer (All-in-One Suite)")
-            .with_inner_size([1360.0, 860.0])
-            .with_min_inner_size([900.0, 600.0]),
+            .with_inner_size([1380.0, 860.0])
+            .with_min_inner_size([920.0, 600.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -1775,29 +2050,46 @@ pub fn run_native_gui(ws: AnalyzerWorkspace) -> std::result::Result<(), String> 
     .map_err(|e| format!("GUI error: {e}"))
 }
 
-/// Generate a rich 14-packet multi-protocol showcase capture (ARP, DNS, TCP, HTTP, TLSv1.3, BGP, MQTT, Modbus/TCP, ICMP).
+fn ipv4_header_checksum(hdr: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut i = 0;
+    while i + 1 < hdr.len() {
+        if i != 10 {
+            sum += u16::from_be_bytes([hdr[i], hdr[i + 1]]) as u32;
+        }
+        i += 2;
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Generate a rich 15-packet multi-protocol showcase capture (ARP, DNS, TCP, HTTP, TLSv1.3, BGP, MQTT, Modbus/TCP, ICMP, TCP RST).
 pub fn generate_sample_showcase_capture() -> CaptureFile {
     let mut cap = CaptureFile::new(CaptureFormat::PcapNg);
     let mac_c = [0x00, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e];
     let mac_s = [0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb];
+    let mac_bcast = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
     let ip_c = [192, 168, 1, 10];
     let ip_gw = [192, 168, 1, 1];
     let ip_web = [93, 184, 216, 34];
 
-    let push_eth = |cap: &mut CaptureFile, sec: u64, nanos: u32, et: u16, l3: &[u8]| {
-        let mut d = Vec::with_capacity(14 + l3.len());
-        d.extend_from_slice(&mac_s);
-        d.extend_from_slice(&mac_c);
-        d.extend_from_slice(&et.to_be_bytes());
-        d.extend_from_slice(l3);
-        let no = (cap.frames.len() + 1) as u64;
-        cap.frames.push(Frame::new(
-            no,
-            Timestamp::from_secs_nanos(1_700_000_000 + sec, nanos),
-            LinkType::Ethernet,
-            d,
-        ));
-    };
+    let push_eth =
+        |cap: &mut CaptureFile, sec: u64, nanos: u32, src_mac: [u8; 6], dst_mac: [u8; 6], et: u16, l3: &[u8]| {
+            let mut d = Vec::with_capacity(14 + l3.len());
+            d.extend_from_slice(&dst_mac);
+            d.extend_from_slice(&src_mac);
+            d.extend_from_slice(&et.to_be_bytes());
+            d.extend_from_slice(l3);
+            let no = (cap.frames.len() + 1) as u64;
+            cap.frames.push(Frame::new(
+                no,
+                Timestamp::from_secs_nanos(1_700_000_000 + sec, nanos),
+                LinkType::Ethernet,
+                d,
+            ));
+        };
 
     let build_ipv4 = |src: [u8; 4], dst: [u8; 4], proto: u8, l4: &[u8]| -> Vec<u8> {
         let total = (20 + l4.len()) as u16;
@@ -1807,6 +2099,8 @@ pub fn generate_sample_showcase_capture() -> CaptureFile {
         v.extend_from_slice(&[0x12, 0x34, 0x40, 0x00, 64, proto, 0x00, 0x00]);
         v.extend_from_slice(&src);
         v.extend_from_slice(&dst);
+        let csum = ipv4_header_checksum(&v[..20]);
+        v[10..12].copy_from_slice(&csum.to_be_bytes());
         v.extend_from_slice(l4);
         v
     };
@@ -1836,20 +2130,20 @@ pub fn generate_sample_showcase_capture() -> CaptureFile {
             t
         };
 
-    // 1 & 2: ARP Request & Reply
+    // 1 & 2: ARP Request (Broadcast) & Reply
     let mut arp_req = vec![0x00, 0x01, 0x08, 0x00, 6, 4, 0x00, 0x01];
     arp_req.extend_from_slice(&mac_c);
     arp_req.extend_from_slice(&ip_c);
     arp_req.extend_from_slice(&[0; 6]);
     arp_req.extend_from_slice(&ip_gw);
-    push_eth(&mut cap, 0, 100_000, 0x0806, &arp_req);
+    push_eth(&mut cap, 0, 100_000, mac_c, mac_bcast, 0x0806, &arp_req);
 
     let mut arp_rep = vec![0x00, 0x01, 0x08, 0x00, 6, 4, 0x00, 0x02];
     arp_rep.extend_from_slice(&mac_s);
     arp_rep.extend_from_slice(&ip_gw);
     arp_rep.extend_from_slice(&mac_c);
     arp_rep.extend_from_slice(&ip_c);
-    push_eth(&mut cap, 0, 450_000, 0x0806, &arp_rep);
+    push_eth(&mut cap, 0, 450_000, mac_s, mac_c, 0x0806, &arp_rep);
 
     // 3 & 4: DNS Query & Response for api.mung-ash.io
     let mut dns_q = vec![0x1a, 0x2b, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
@@ -1858,6 +2152,8 @@ pub fn generate_sample_showcase_capture() -> CaptureFile {
         &mut cap,
         0,
         1_200_000,
+        mac_c,
+        mac_s,
         0x0800,
         &build_ipv4(ip_c, ip_gw, 17, &build_udp(53111, 53, &dns_q)),
     );
@@ -1870,6 +2166,8 @@ pub fn generate_sample_showcase_capture() -> CaptureFile {
         &mut cap,
         0,
         8_500_000,
+        mac_s,
+        mac_c,
         0x0800,
         &build_ipv4(ip_gw, ip_c, 17, &build_udp(53, 53111, &dns_r)),
     );
@@ -1879,6 +2177,8 @@ pub fn generate_sample_showcase_capture() -> CaptureFile {
         &mut cap,
         0,
         10_000_000,
+        mac_c,
+        mac_s,
         0x0800,
         &build_ipv4(ip_c, ip_web, 6, &build_tcp(54321, 80, 1000, 0, 0x02, b"")),
     );
@@ -1886,6 +2186,8 @@ pub fn generate_sample_showcase_capture() -> CaptureFile {
         &mut cap,
         0,
         24_000_000,
+        mac_s,
+        mac_c,
         0x0800,
         &build_ipv4(
             ip_web,
@@ -1898,6 +2200,8 @@ pub fn generate_sample_showcase_capture() -> CaptureFile {
         &mut cap,
         0,
         25_000_000,
+        mac_c,
+        mac_s,
         0x0800,
         &build_ipv4(
             ip_c,
@@ -1914,6 +2218,8 @@ pub fn generate_sample_showcase_capture() -> CaptureFile {
         &mut cap,
         0,
         30_000_000,
+        mac_c,
+        mac_s,
         0x0800,
         &build_ipv4(
             ip_c,
@@ -1927,6 +2233,8 @@ pub fn generate_sample_showcase_capture() -> CaptureFile {
         &mut cap,
         0,
         55_000_000,
+        mac_s,
+        mac_c,
         0x0800,
         &build_ipv4(
             ip_web,
@@ -1947,6 +2255,8 @@ pub fn generate_sample_showcase_capture() -> CaptureFile {
         &mut cap,
         1,
         0,
+        mac_c,
+        mac_s,
         0x0800,
         &build_ipv4(
             ip_c,
@@ -1964,6 +2274,8 @@ pub fn generate_sample_showcase_capture() -> CaptureFile {
         &mut cap,
         1,
         100_000_000,
+        mac_c,
+        mac_s,
         0x0800,
         &build_ipv4(ip_c, ip_gw, 6, &build_tcp(49100, 179, 1, 1, 0x18, &bgp)),
     );
@@ -1974,6 +2286,8 @@ pub fn generate_sample_showcase_capture() -> CaptureFile {
         &mut cap,
         1,
         200_000_000,
+        mac_c,
+        mac_s,
         0x0800,
         &build_ipv4(ip_c, ip_gw, 6, &build_tcp(49200, 1883, 1, 1, 0x18, mqtt)),
     );
@@ -1984,6 +2298,8 @@ pub fn generate_sample_showcase_capture() -> CaptureFile {
         &mut cap,
         1,
         300_000_000,
+        mac_c,
+        mac_s,
         0x0800,
         &build_ipv4(ip_c, ip_gw, 6, &build_tcp(49300, 502, 1, 1, 0x18, &modbus)),
     );
@@ -1994,6 +2310,8 @@ pub fn generate_sample_showcase_capture() -> CaptureFile {
         &mut cap,
         1,
         400_000_000,
+        mac_c,
+        mac_s,
         0x0800,
         &build_ipv4(ip_c, ip_web, 1, &icmp),
     );

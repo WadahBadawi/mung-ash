@@ -671,10 +671,19 @@ impl FieldTree {
             {
                 match best {
                     None => best = Some(node),
-                    Some(prev) if node.byte_range.len() <= prev.byte_range.len() => {
-                        best = Some(node);
+                    Some(prev) => {
+                        let n_len = node.byte_range.len();
+                        let p_len = prev.byte_range.len();
+                        if n_len < p_len
+                            || (n_len == p_len && prev.parent.is_none() && node.parent.is_some())
+                            || (n_len == p_len
+                                && prev.byte_range.bitmask.is_none()
+                                && node.byte_range.bitmask.is_none()
+                                && node.parent == Some(prev.id))
+                        {
+                            best = Some(node);
+                        }
                     }
-                    _ => {}
                 }
             }
         }

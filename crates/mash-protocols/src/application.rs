@@ -261,20 +261,30 @@ impl Dissector for DnsDissector {
                     }
                     let qtype = u16::from_be_bytes([msg[next_off], msg[next_off + 1]]);
                     let qclass = u16::from_be_bytes([msg[next_off + 2], msg[next_off + 3]]);
-                    let q_range = ByteRange::with_source(
+                    let name_range = ByteRange::with_source(
                         buf.source_idx(),
                         dns_base_abs + offset,
+                        dns_base_abs + next_off,
+                    );
+                    let qtype_range = ByteRange::with_source(
+                        buf.source_idx(),
+                        dns_base_abs + next_off,
+                        dns_base_abs + next_off + 2,
+                    );
+                    let qclass_range = ByteRange::with_source(
+                        buf.source_idx(),
+                        dns_base_abs + next_off + 2,
                         dns_base_abs + next_off + 4,
                     );
-                    ctx.add_str(Some(root), "dns.qry.name", qname.clone(), q_range, None);
+                    ctx.add_str(Some(root), "dns.qry.name", qname.clone(), name_range, None);
                     ctx.add_u64(
                         Some(root),
                         "dns.qry.type",
                         qtype as u64,
-                        q_range,
+                        qtype_range,
                         Some(format!("Type: {} ({qtype})", dns_qtype_name(qtype))),
                     );
-                    ctx.add_u64(Some(root), "dns.qry.class", qclass as u64, q_range, None);
+                    ctx.add_u64(Some(root), "dns.qry.class", qclass as u64, qclass_range, None);
                     query_summaries.push(format!("{} {}", dns_qtype_name(qtype), qname));
                     offset = next_off + 4;
                 }
@@ -335,25 +345,35 @@ impl Dissector for DnsDissector {
                 break;
             }
 
-            let rr_range = ByteRange::with_source(
+            let name_range = ByteRange::with_source(
                 buf.source_idx(),
                 dns_base_abs + offset,
-                dns_base_abs + rdata_end,
+                dns_base_abs + next_off,
+            );
+            let rtype_range = ByteRange::with_source(
+                buf.source_idx(),
+                dns_base_abs + next_off,
+                dns_base_abs + next_off + 2,
+            );
+            let ttl_range = ByteRange::with_source(
+                buf.source_idx(),
+                dns_base_abs + next_off + 4,
+                dns_base_abs + next_off + 8,
             );
             let rdata_range = ByteRange::with_source(
                 buf.source_idx(),
                 dns_base_abs + rdata_start,
                 dns_base_abs + rdata_end,
             );
-            ctx.add_str(Some(root), "dns.resp.name", rr_name.clone(), rr_range, None);
+            ctx.add_str(Some(root), "dns.resp.name", rr_name.clone(), name_range, None);
             ctx.add_u64(
                 Some(root),
                 "dns.resp.type",
                 rtype as u64,
-                rr_range,
+                rtype_range,
                 Some(format!("Type: {} ({rtype})", dns_qtype_name(rtype))),
             );
-            ctx.add_u64(Some(root), "dns.resp.ttl", ttl as u64, rr_range, None);
+            ctx.add_u64(Some(root), "dns.resp.ttl", ttl as u64, ttl_range, None);
 
             let rdata = &msg[rdata_start..rdata_end];
             match rtype {

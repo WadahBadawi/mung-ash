@@ -1263,32 +1263,33 @@ impl DissectorEngine {
             frame.interface_id
         );
         let frame_root = ctx.begin_protocol(self.frame_proto_id, frame_label, full_range);
+        let meta_range = ByteRange::new(0, 0);
         ctx.add_u64(
             Some(frame_root),
             "frame.number",
             frame.number,
-            full_range,
+            meta_range,
             None,
         );
         ctx.add_u64(
             Some(frame_root),
             "frame.len",
             frame.orig_len as u64,
-            full_range,
+            meta_range,
             None,
         );
         ctx.add_u64(
             Some(frame_root),
             "frame.cap_len",
             frame.captured_len as u64,
-            full_range,
+            meta_range,
             None,
         );
         ctx.add_field(
             Some(frame_root),
             "frame.time_epoch",
             FieldValue::F64(frame.timestamp.as_secs_f64()),
-            full_range,
+            meta_range,
             Some(format!(
                 "Epoch Time: {} seconds",
                 frame.timestamp.format_epoch()
@@ -1299,7 +1300,7 @@ impl DissectorEngine {
             Some(frame_root),
             "frame.time_relative",
             rel_time_sec,
-            full_range,
+            meta_range,
             Some(format!(
                 "[Time since reference or first frame: {rel_time_sec:.9} seconds]"
             )),
@@ -1308,7 +1309,7 @@ impl DissectorEngine {
             Some(frame_root),
             "frame.time_delta",
             delta_time_sec,
-            full_range,
+            meta_range,
             Some(format!(
                 "[Time delta from previous captured frame: {delta_time_sec:.9} seconds]"
             )),
@@ -1317,7 +1318,7 @@ impl DissectorEngine {
             Some(frame_root),
             "frame.interface_id",
             frame.interface_id as u64,
-            full_range,
+            meta_range,
             None,
         );
         for c in &frame.comments {
@@ -1325,7 +1326,7 @@ impl DissectorEngine {
                 Some(frame_root),
                 "frame.comment",
                 c.clone(),
-                full_range,
+                meta_range,
                 None,
             );
             ctx.add_expert(
@@ -1333,14 +1334,14 @@ impl DissectorEngine {
                 ExpertSeverity::Chat,
                 ExpertGroup::Comments,
                 c.clone(),
-                full_range,
+                meta_range,
             );
         }
         if frame.flags.marked {
-            ctx.add_bool(Some(frame_root), "frame.marked", true, full_range, None);
+            ctx.add_bool(Some(frame_root), "frame.marked", true, meta_range, None);
         }
         if frame.flags.ignored {
-            ctx.add_bool(Some(frame_root), "frame.ignored", true, full_range, None);
+            ctx.add_bool(Some(frame_root), "frame.ignored", true, meta_range, None);
         }
 
         let mut cursor = PacketCursor::new(&frame.data);

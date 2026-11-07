@@ -153,8 +153,10 @@ pub struct AnalyzerWorkspace {
     pub selected_frame: Option<u64>,
     /// Currently selected `NodeId` in Pane 2 (Packet Details tree).
     pub selected_node: Option<NodeId>,
-    /// Expanded `NodeId`s in Pane 2.
+    /// Expanded `NodeId`s in Pane 2 for the active packet.
     pub expanded_nodes: HashSet<NodeId>,
+    /// Expanded protocol/field abbreviations persisted across packets in Pane 2.
+    pub expanded_abbrevs: HashSet<String>,
     /// Active data source tab in Pane 3 (0 = Frame, 1+ = Secondary DataSource).
     pub active_source_tab: u8,
     /// Highlighted byte range in Pane 3 (`GUI-02` bidirectional sync).
@@ -172,6 +174,14 @@ impl AnalyzerWorkspace {
     pub fn new() -> Self {
         let engine = build_default_engine();
         let profile = WorkspaceProfile::default();
+        let default_expanded: HashSet<String> = [
+            "eth", "vlan", "arp", "ip", "ipv6", "icmp", "icmpv6", "tcp", "udp", "dns", "dhcp",
+            "dhcpv6", "http", "tls", "quic", "ntp", "bgp", "ospf", "mqtt", "modbus", "smb2",
+            "grpc", "vxlan", "gre", "mpls",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
         let mut ws = Self {
             engine,
             ai: AiEngine::default_local(),
@@ -184,6 +194,7 @@ impl AnalyzerWorkspace {
             selected_frame: None,
             selected_node: None,
             expanded_nodes: HashSet::new(),
+            expanded_abbrevs: default_expanded,
             active_source_tab: 0,
             highlighted_bytes: None,
             compiled_coloring: Vec::new(),
@@ -211,8 +222,16 @@ impl AnalyzerWorkspace {
         Ok(())
     }
 
-    pub fn load_capture(&mut self, cap: CaptureFile) {
+    pub fn load_capture(&mut self, mut cap: CaptureFile) {
+        for (idx, frame) in cap.frames.iter_mut().enumerate() {
+            frame.number = (idx + 1) as u64;
+        }
         self.frames = cap.frames;
+        self.selected_frame = None;
+        self.selected_node = None;
+        self.expanded_nodes.clear();
+        self.active_source_tab = 0;
+        self.highlighted_bytes = None;
         self.redissect_all();
     }
 
@@ -241,10 +260,6 @@ impl AnalyzerWorkspace {
         let _ = mash_stats::analyze_tcp_flows(&mut self.dissected);
         let current_filter = self.filter_input.clone();
         self.set_display_filter(&current_filter);
-        if self.selected_frame.is_none() && !self.filtered_indices.is_empty() {
-            let first_idx = self.filtered_indices[0];
-            self.select_frame(self.dissected[first_idx].summary.number);
-        }
     }
 
     /// Update the live display filter bar, validating syntax and updating `filtered_indices` (`GUI-04`).
@@ -256,24 +271,124 @@ impl AnalyzerWorkspace {
             self.filtered_indices = (0..self.dissected.len())
                 .filter(|&i| !self.frames[i].flags.ignored)
                 .collect();
-            return;
+        } else {
+            match CompiledFilter::compile(trimmed, Some(&self.engine.registry)) {
+                Ok(cf) => {
+                    self.filter_status = FilterBarStatus::Valid;
+                    self.filtered_indices = self
+                        .dissected
+                        .iter()
+                        .enumerate()
+                        .filter(|&(i, pkt)| !self.frames[i].flags.ignored && cf.matches(pkt))
+                        .map(|(i, _)| i)
+                        .collect();
+                }
+                Err(diag) => {
+                    self.filter_status = FilterBarStatus::Invalid(diag);
+                    return;
+                }
+            }
         }
 
-        match CompiledFilter::compile(trimmed, Some(&self.engine.registry)) {
-            Ok(cf) => {
-                self.filter_status = FilterBarStatus::Valid;
-                self.filtered_indices = self
-                    .dissected
-                    .iter()
-                    .enumerate()
-                    .filter(|&(i, pkt)| !self.frames[i].flags.ignored && cf.matches(pkt))
-                    .map(|(i, _)| i)
-                    .collect();
-            }
-            Err(diag) => {
-                self.filter_status = FilterBarStatus::Invalid(diag);
+        // Ensure `selected_frame` points to a currently visible packet
+        let sel_visible = self.selected_frame.is_some_and(|fno| {
+            let idx = (fno.saturating_sub(1)) as usize;
+            self.filtered_indices.contains(&idx)
+        });
+        if !sel_visible {
+            if let Some(&first_idx) = self.filtered_indices.first() {
+                let fno = self.dissected[first_idx].summary.number;
+                self.select_frame(fno);
+            } else {
+                self.selected_frame = None;
+                self.selected_node = None;
+                self.highlighted_bytes = None;
             }
         }
+    }
+
+    pub fn is_node_expanded(&self, node_id: NodeId, abbrev: &str) -> bool {
+        self.expanded_nodes.contains(&node_id) || self.expanded_abbrevs.contains(abbrev)
+    }
+
+    pub fn toggle_node_expanded(&mut self, node_id: NodeId, abbrev: &str) {
+        if self.is_node_expanded(node_id, abbrev) {
+            self.expanded_nodes.remove(&node_id);
+            self.expanded_abbrevs.remove(abbrev);
+        } else {
+            self.expanded_nodes.insert(node_id);
+            self.expanded_abbrevs.insert(abbrev.to_string());
+        }
+    }
+
+    pub fn expand_all_nodes(&mut self) {
+        if let Some(fno) = self.selected_frame {
+            if let Some(pkt) = self.dissected.get((fno - 1) as usize) {
+                for n in &pkt.tree.nodes {
+                    if !n.children.is_empty() {
+                        self.expanded_nodes.insert(n.id);
+                        self.expanded_abbrevs.insert(n.abbrev.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn collapse_all_nodes(&mut self) {
+        self.expanded_nodes.clear();
+        self.expanded_abbrevs.clear();
+    }
+
+    pub fn select_next_displayed_frame(&mut self) -> Option<u64> {
+        if self.filtered_indices.is_empty() {
+            return None;
+        }
+        let next_idx = if let Some(cur_fno) = self.selected_frame {
+            let cur_vec_idx = (cur_fno.saturating_sub(1)) as usize;
+            if let Some(pos) = self.filtered_indices.iter().position(|&i| i == cur_vec_idx) {
+                self.filtered_indices[(pos + 1).min(self.filtered_indices.len() - 1)]
+            } else {
+                self.filtered_indices[0]
+            }
+        } else {
+            self.filtered_indices[0]
+        };
+        let fno = self.dissected.get(next_idx)?.summary.number;
+        self.select_frame(fno);
+        Some(fno)
+    }
+
+    pub fn select_prev_displayed_frame(&mut self) -> Option<u64> {
+        if self.filtered_indices.is_empty() {
+            return None;
+        }
+        let prev_idx = if let Some(cur_fno) = self.selected_frame {
+            let cur_vec_idx = (cur_fno.saturating_sub(1)) as usize;
+            if let Some(pos) = self.filtered_indices.iter().position(|&i| i == cur_vec_idx) {
+                self.filtered_indices[pos.saturating_sub(1)]
+            } else {
+                self.filtered_indices[0]
+            }
+        } else {
+            self.filtered_indices[0]
+        };
+        let fno = self.dissected.get(prev_idx)?.summary.number;
+        self.select_frame(fno);
+        Some(fno)
+    }
+
+    pub fn select_first_displayed_frame(&mut self) -> Option<u64> {
+        let &first_idx = self.filtered_indices.first()?;
+        let fno = self.dissected.get(first_idx)?.summary.number;
+        self.select_frame(fno);
+        Some(fno)
+    }
+
+    pub fn select_last_displayed_frame(&mut self) -> Option<u64> {
+        let &last_idx = self.filtered_indices.last()?;
+        let fno = self.dissected.get(last_idx)?.summary.number;
+        self.select_frame(fno);
+        Some(fno)
     }
 
     pub fn autocomplete(&self, max_items: usize) -> Vec<String> {
@@ -314,6 +429,7 @@ impl AnalyzerWorkspace {
         if frame_number >= 1 && (frame_number as usize) <= self.dissected.len() {
             self.selected_frame = Some(frame_number);
             self.selected_node = None;
+            self.expanded_nodes.clear();
             self.active_source_tab = 0;
             self.highlighted_bytes = None;
         }
@@ -345,7 +461,12 @@ impl AnalyzerWorkspace {
         let mut curr = node.parent;
         while let Some(pid) = curr {
             self.expanded_nodes.insert(pid);
-            curr = pkt.tree.node(pid).and_then(|n| n.parent);
+            if let Some(parent_node) = pkt.tree.node(pid) {
+                self.expanded_abbrevs.insert(parent_node.abbrev.clone());
+                curr = parent_node.parent;
+            } else {
+                curr = None;
+            }
         }
         self.selected_node = Some(nid);
         self.active_source_tab = source_idx;
@@ -521,9 +642,37 @@ mod tests {
     #[test]
     fn unified_all_in_one_gui_app_state() {
         let ws = AnalyzerWorkspace::new();
-        let app = crate::app::MashGuiApp::new(ws);
+        let mut app = crate::app::MashGuiApp::new(ws);
         assert_eq!(app.ws.frames.len(), 14);
         assert!(!app.tcp_streams.is_empty());
         assert!(!app.udp_streams.is_empty());
+
+        // Verify IPv4 checksums in showcase capture are valid ("Good")
+        let pkt3 = &app.ws.dissected[2];
+        let csum_status = pkt3
+            .tree
+            .by_abbrev("ip.checksum.status")
+            .next()
+            .map(|n| n.value.display_value());
+        assert_eq!(csum_status.as_deref(), Some("Good"));
+
+        // Verify filtering to "http" automatically jumps `selected_frame` to Frame #8 (first HTTP packet)
+        app.ws.set_display_filter("http");
+        assert_eq!(app.ws.selected_frame, Some(8));
+        assert_eq!(app.ws.select_next_displayed_frame(), Some(9));
+        assert_eq!(app.ws.select_prev_displayed_frame(), Some(8));
+
+        // Verify clicking TCP flags byte offset 47 selects `tcp.flags` (not `tcp.flags.fin`)
+        let nid = app.ws.select_byte_offset(0, 47).unwrap();
+        let selected_abbrev = app.ws.dissected[7]
+            .tree
+            .node(nid)
+            .map(|n| n.abbrev.as_str());
+        assert_eq!(selected_abbrev, Some("tcp.flags"));
+
+        // Verify deterministic tree node expansion toggle
+        assert!(app.ws.is_node_expanded(NodeId(0), "eth"));
+        app.ws.toggle_node_expanded(NodeId(0), "eth");
+        assert!(!app.ws.is_node_expanded(NodeId(0), "eth"));
     }
 }
