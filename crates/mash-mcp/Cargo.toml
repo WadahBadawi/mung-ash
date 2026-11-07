@@ -1,0 +1,24 @@
+[package]
+name = "mash-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mash-mcp"
+path = "src/main.rs"
+
+[dependencies]
+mash-core.workspace = true
+mash-dissect.workspace = true
+mash-filter.workspace = true
+mash-pcapfile.workspace = true
+mash-protocols.workspace = true
+mash-reassembly.workspace = true
+mash-stats.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
+

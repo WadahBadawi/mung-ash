@@ -1,0 +1,16 @@
+[package]
+name = "mash-stats"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mash-core.workspace = true
+mash-pcapfile.workspace = true
+mash-reassembly.workspace = true
+serde.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true
+

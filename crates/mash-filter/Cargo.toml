@@ -1,0 +1,16 @@
+[package]
+name = "mash-filter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mash-core.workspace = true
+mash-dissect.workspace = true
+regex.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
+

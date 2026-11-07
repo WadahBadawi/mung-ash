@@ -1,0 +1,62 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mash-core",
+    "crates/mash-pcapfile",
+    "crates/mash-dissect",
+    "crates/mash-protocols",
+    "crates/mash-reassembly",
+    "crates/mash-filter",
+    "crates/mash-crypto",
+    "crates/mash-stats",
+    "crates/mash-ai",
+    "crates/mash-mcp",
+    "crates/mash-plugin",
+    "crates/mash-capture",
+    "crates/mash-cap",
+    "crates/mash-cli",
+    "crates/mash-gui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["MUNG-ASH Contributors"]
+repository = "https://github.com/storytold/mung-ash"
+
+[workspace.dependencies]
+mash-core = { path = "crates/mash-core" }
+mash-pcapfile = { path = "crates/mash-pcapfile" }
+mash-dissect = { path = "crates/mash-dissect" }
+mash-protocols = { path = "crates/mash-protocols" }
+mash-reassembly = { path = "crates/mash-reassembly" }
+mash-filter = { path = "crates/mash-filter" }
+mash-crypto = { path = "crates/mash-crypto" }
+mash-stats = { path = "crates/mash-stats" }
+mash-ai = { path = "crates/mash-ai" }
+mash-mcp = { path = "crates/mash-mcp" }
+mash-plugin = { path = "crates/mash-plugin" }
+mash-capture = { path = "crates/mash-capture" }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+flate2 = "1.0"
+lz4_flex = "0.11"
+regex = "1.10"
+sha2 = "0.10"
+hmac = "0.12"
+hkdf = "0.12"
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+zeroize = { version = "1.8", features = ["derive"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+

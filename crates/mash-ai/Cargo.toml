@@ -1,0 +1,19 @@
+[package]
+name = "mash-ai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mash-core.workspace = true
+mash-dissect.workspace = true
+mash-filter.workspace = true
+mash-stats.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true
+

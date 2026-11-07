@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+*.pcap
+*.pcapng
+!tests/fixtures/*.pcap
+!tests/fixtures/*.pcapng
+.DS_Store
+Thumbs.db
+

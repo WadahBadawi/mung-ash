@@ -1,0 +1,44 @@
+[package]
+name = "mash-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mash"
+path = "src/bin/mash.rs"
+
+[[bin]]
+name = "mash-info"
+path = "src/bin/mash_info.rs"
+
+[[bin]]
+name = "mash-edit"
+path = "src/bin/mash_edit.rs"
+
+[[bin]]
+name = "mash-merge"
+path = "src/bin/mash_merge.rs"
+
+[[bin]]
+name = "mash-text2pcap"
+path = "src/bin/mash_text2pcap.rs"
+
+[dependencies]
+mash-core.workspace = true
+mash-pcapfile.workspace = true
+mash-dissect.workspace = true
+mash-protocols.workspace = true
+mash-reassembly.workspace = true
+mash-filter.workspace = true
+mash-crypto.workspace = true
+mash-stats.workspace = true
+mash-ai.workspace = true
+mash-capture.workspace = true
+mash-plugin.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
+
